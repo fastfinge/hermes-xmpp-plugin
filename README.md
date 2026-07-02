@@ -26,6 +26,13 @@ slixmpp-omemo is installed, 1:1 messages are also end-to-end encrypted so the
 server cannot read content. MUC OMEMO support depends on client/device
 availability.
 
+## Companion X/Twitter Alerts
+
+For social monitoring profiles, pair this gateway with
+[Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet). Hermes Tweet can
+read relevant X/Twitter accounts, posts, or trends inside Hermes, then this XMPP
+plugin can deliver the summary or follow-up prompt through a JID or room.
+
 ## Credits
 
 Most adapter code is derived from Eric Lars Lee's upstream PR #17469. Mibay's
