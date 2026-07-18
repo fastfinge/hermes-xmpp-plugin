@@ -30,6 +30,10 @@ optional_env:
     description: Force direct TLS (XEP-0368) on/off; auto-enabled when XMPP_PORT is 5223
     prompt: Force direct TLS? true/false
     password: false
+  - name: XMPP_CONNECT_TIMEOUT_SECS
+    description: How long connect() waits for the session to establish before giving up (default 25 seconds). Raise this on a slow/high-latency link to the server.
+    prompt: Connect timeout in seconds
+    password: false
   - name: XMPP_ALLOWED_USERS
     description: Comma-separated bare JIDs allowed to DM the bot
     prompt: Allowed user JIDs

@@ -367,9 +367,18 @@ class XmppAdapter(BasePlatformAdapter):
 
     # How long connect() waits for the session to establish before declaring a
     # retryable failure. Keep under the gateway's own per-platform connect
-    # timeout (typically ~30s) so our diagnosis (bad host, rejected login)
-    # wins over a generic gateway-level timeout.
-    _CONNECT_TIMEOUT_SECS = 20.0
+    # timeout (HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, default 30s) so our
+    # diagnosis (bad host, rejected login) wins over a generic gateway-level
+    # timeout/cancellation. 25s (not 30s) leaves headroom for our own
+    # disconnect()/cleanup to run before the outer wait_for fires.
+    #
+    # 20s turned out too tight in the wild: TLS/SASL negotiation to a real
+    # server can legitimately take longer than that (slow network, IPv6
+    # attempted-then-abandoned, etc.), which surfaced as spurious
+    # xmpp_connect_timeout failures on a connection that would have
+    # succeeded a few seconds later. Overridable via XMPP_CONNECT_TIMEOUT_SECS
+    # / the connect_timeout_secs config key for slower links.
+    _CONNECT_TIMEOUT_SECS = 25.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
@@ -390,6 +399,22 @@ class XmppAdapter(BasePlatformAdapter):
                     self.MAX_MESSAGE_LENGTH = _max_len
             except (TypeError, ValueError):
                 logger.warning("xmpp: invalid max_message_length %r, using default", _max_len_raw)
+
+        # Allow operators on a slow/high-latency link to the server to raise
+        # the connect-session-establish timeout beyond the 25s default. Falls
+        # back to the class default on any bad value.
+        _connect_timeout_raw = None
+        if isinstance(extra, dict):
+            _connect_timeout_raw = extra.get("connect_timeout_secs") or os.getenv("XMPP_CONNECT_TIMEOUT_SECS")
+        if _connect_timeout_raw:
+            try:
+                _connect_timeout = float(_connect_timeout_raw)
+                if _connect_timeout > 0:
+                    self._CONNECT_TIMEOUT_SECS = _connect_timeout
+            except (TypeError, ValueError):
+                logger.warning(
+                    "xmpp: invalid connect_timeout_secs %r, using default", _connect_timeout_raw
+                )
 
         self.jid: str = str(extra.get("jid") or os.getenv("XMPP_JID", ""))
         self._password: str = str(extra.get("password") or os.getenv("XMPP_PASSWORD", ""))
@@ -1736,6 +1761,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         ("XMPP_HOST", "host"),
         ("XMPP_PORT", "port"),
         ("XMPP_DIRECT_TLS", "direct_tls"),
+        ("XMPP_CONNECT_TIMEOUT_SECS", "connect_timeout_secs"),
         ("XMPP_MUC_ROOMS", "muc_rooms"),
         ("XMPP_MUC_NICK", "muc_nick"),
         ("XMPP_ALLOWED_USERS", "allowed_users"),
@@ -1751,8 +1777,8 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     raw = dict(xmpp_cfg or {})
     extra = dict(raw.get("extra") or {})
     for key in (
-        "jid", "password", "host", "port", "direct_tls", "muc_rooms", "muc_nick",
-        "allowed_users", "allow_all_users", "max_message_length",
+        "jid", "password", "host", "port", "direct_tls", "connect_timeout_secs",
+        "muc_rooms", "muc_nick", "allowed_users", "allow_all_users", "max_message_length",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]
@@ -1776,6 +1802,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         "host": "XMPP_HOST",
         "port": "XMPP_PORT",
         "direct_tls": "XMPP_DIRECT_TLS",
+        "connect_timeout_secs": "XMPP_CONNECT_TIMEOUT_SECS",
         "muc_rooms": "XMPP_MUC_ROOMS",
         "muc_nick": "XMPP_MUC_NICK",
         "allowed_users": "XMPP_ALLOWED_USERS",

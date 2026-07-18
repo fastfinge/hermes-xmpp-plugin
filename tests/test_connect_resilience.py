@@ -531,3 +531,48 @@ async def test_subscribe_ignored_for_disallowed_peer():
 def test_splits_long_messages_declared():
     a = adapter.XmppAdapter(_make_cfg())
     assert a.splits_long_messages is True
+
+
+# -----------------------------------------------------------------
+# Connect-session-establish timeout: 20s proved too tight against a real
+# server in production (TLS/SASL negotiation exceeded it on a working
+# connection) — default bumped to 25s and made operator-configurable.
+# -----------------------------------------------------------------
+
+def test_connect_timeout_default_is_25s():
+    a = adapter.XmppAdapter(_make_cfg())
+    assert a._CONNECT_TIMEOUT_SECS == 25.0
+
+
+def test_connect_timeout_overridable_via_extra_key():
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="45"))
+    assert a._CONNECT_TIMEOUT_SECS == 45.0
+
+
+def test_connect_timeout_overridable_via_env_var(monkeypatch):
+    monkeypatch.setenv("XMPP_CONNECT_TIMEOUT_SECS", "12.5")
+    a = adapter.XmppAdapter(_make_cfg())
+    assert a._CONNECT_TIMEOUT_SECS == 12.5
+
+
+def test_connect_timeout_invalid_value_falls_back_to_default(monkeypatch):
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="not-a-number"))
+    assert a._CONNECT_TIMEOUT_SECS == 25.0
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_instance_level_timeout_override(monkeypatch):
+    """connect() must await self._CONNECT_TIMEOUT_SECS (the per-instance
+    value), not the class-level default — this is what lets an operator on a
+    slow link raise the limit via XMPP_CONNECT_TIMEOUT_SECS / config."""
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.3"))
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    async def _drive():
+        await asyncio.sleep(0.15)
+        await a.client.fire("session_start")
+
+    task = asyncio.create_task(_drive())
+    ok = await a.connect()
+    await task
+    assert ok is True

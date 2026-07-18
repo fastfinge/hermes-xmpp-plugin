@@ -28,6 +28,9 @@ All notable changes to this project will be documented in this file.
 - `splits_long_messages = True` is now declared on the adapter so a host
   gateway that checks it can skip pre-truncating cron/delivery output before
   `send()` ever sees it.
+- **Configurable connect timeout**: the session-establish wait added below is
+  tunable via `XMPP_CONNECT_TIMEOUT_SECS` / the `connect_timeout_secs` config
+  key, for operators on a slow or high-latency link to their server.
 
 ### Fixed
 
@@ -37,11 +40,17 @@ All notable changes to this project will be documented in this file.
   `_truthy()` helper everywhere instead of `bool(str)`. Plain `bool("False")`
   is `True` for any non-empty string, so setting `XMPP_OMEMO_ENABLED=False` in
   `.env` was silently ignored and OMEMO stayed on.
-- `connect()` now waits (bounded, 20s) for the XMPP session to actually
-  establish before reporting success, and sets a retryable fatal error on
-  timeout. Previously it reported "connected" as soon as `client.connect()`
-  returned a Future, so an unreachable server, wrong host, or rejected login
-  left the gateway believing XMPP was up over a dead socket.
+- **Connect-timeout default raised 20s → 25s** after a real deploy showed the
+  20s wait was too tight: TLS/SASL negotiation to a real server legitimately
+  took longer than that, so a connection that would have succeeded a few
+  seconds later was misdiagnosed as `xmpp_connect_timeout` and dropped into
+  the retry/backoff cycle instead. Now configurable per the above, since a
+  fixed constant can't fit every network.
+- `connect()` now waits (bounded, 25s by default) for the XMPP session to
+  actually establish before reporting success, and sets a retryable fatal
+  error on timeout. Previously it reported "connected" as soon as
+  `client.connect()` returned a Future, so an unreachable server, wrong host,
+  or rejected login left the gateway believing XMPP was up over a dead socket.
 - `connect()` no longer silently drops `XMPP_HOST`/`XMPP_PORT` on a fallback
   path. The old code called `client.connect(address=(host, port))`, which
   isn't a valid slixmpp kwarg — it always raised `TypeError` and fell through
