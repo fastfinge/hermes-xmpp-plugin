@@ -41,9 +41,8 @@ def test_parse_muc_rooms_with_optional_nick():
 
 
 def test_apply_yaml_config_seeds_extra_and_env(monkeypatch):
-    for name in [
-        "XMPP_JID", "XMPP_PASSWORD", "XMPP_ALLOWED_USERS", "XMPP_HOME_CHANNEL"
-    ]:
+    env_names = ["XMPP_JID", "XMPP_PASSWORD", "XMPP_ALLOWED_USERS", "XMPP_HOME_CHANNEL"]
+    for name in env_names:
         monkeypatch.delenv(name, raising=False)
     extra = adapter._apply_yaml_config({}, {
         "jid": "bot@example.org",
@@ -55,6 +54,12 @@ def test_apply_yaml_config_seeds_extra_and_env(monkeypatch):
     assert os.environ["XMPP_JID"] == "bot@example.org"
     assert os.environ["XMPP_ALLOWED_USERS"] == "sam@example.org,mom@example.org"
     assert os.environ["XMPP_HOME_CHANNEL"] == "sam@example.org"
+    # _apply_yaml_config sets these via raw os.environ[...] = ..., which
+    # monkeypatch's own teardown does not know to revert (it only reverts
+    # changes made through monkeypatch itself) — clean up explicitly so
+    # these don't leak into other tests in the same process.
+    for name in env_names:
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_validate_config_accepts_extra_without_env(monkeypatch):

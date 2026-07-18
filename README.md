@@ -66,7 +66,7 @@ XMPP_ALLOWED_USERS=sam@example.org
 XMPP_HOST=example.org
 XMPP_PORT=5222
 # XMPP_DIRECT_TLS=true   # force XEP-0368 direct TLS; auto-on when XMPP_PORT=5223
-# XMPP_CONNECT_TIMEOUT_SECS=150  # default 90s; raise on a slow/high-latency link
+# XMPP_CONNECT_TIMEOUT_SECS=240  # default 180s; raise further on a slow/high-latency link
 XMPP_MUC_ROOMS=room@conference.example.org/hermes
 XMPP_MUC_NICK=hermes
 XMPP_HOME_CHANNEL=sam@example.org
@@ -164,10 +164,17 @@ supporting XEP-0444, XEP-0461, and XEP-0394.
 - `xmpp_connect_timeout`: the gateway will report the platform as connected
   right away (connecting doesn't block gateway startup), but a background
   watchdog gives up and retries if the session hasn't actually established
-  within `XMPP_CONNECT_TIMEOUT_SECS` (default 90s) — DNS/firewall/SRV issue,
-  or just a slow/high-latency link to the server. Try `XMPP_HOST`/`XMPP_PORT`,
-  check the server is reachable, or raise `XMPP_CONNECT_TIMEOUT_SECS` if the
-  connection succeeds on a retry.
+  within `XMPP_CONNECT_TIMEOUT_SECS` (default 180s). A common cause on home
+  networks: DNS returns both an A and AAAA record for the server, the IPv6
+  route is silently blackholed, and the OS burns through its full TCP retry
+  budget (~130s on Linux defaults) before falling back to IPv4 — which then
+  connects instantly. Check `python3 -c "import socket;
+  print(socket.getaddrinfo('your.server', 5222))"` for a AAAA record, test
+  IPv6 reachability separately (`ping6`/`curl -6`), and either fix IPv6
+  routing or disable IPv6 for this host if it's not actually usable. If
+  raising `XMPP_CONNECT_TIMEOUT_SECS` further fixes it, that confirms this
+  cause. Otherwise it's a DNS/firewall/SRV/reachability issue — try
+  `XMPP_HOST`/`XMPP_PORT` or check the server is reachable at all.
 - `xmpp_connection_lost`: an established session dropped unexpectedly (server
   restart, network blip); the gateway's reconnect watcher should retry.
 - `xmpp_lock`: another gateway process is already logged into this JID; stop

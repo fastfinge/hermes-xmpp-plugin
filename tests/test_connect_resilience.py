@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -213,6 +213,7 @@ class _FakeSlixmppClient:
         self.enable_starttls = None
         self.enable_direct_tls = None
         self.enable_plaintext = None
+        self.cancel_connection_attempt_calls = 0
 
     def register_plugin(self, name, *a, **k):
         self.plugins[name] = MagicMock()
@@ -223,6 +224,9 @@ class _FakeSlixmppClient:
     def connect(self, *a, **k):
         self.connect_calls.append((a, k))
         return None
+
+    def cancel_connection_attempt(self):
+        self.cancel_connection_attempt_calls += 1
 
     def disconnect(self, *a, **k):
         if not self.disconnected.done():
@@ -317,6 +321,53 @@ async def test_readiness_does_not_depend_on_session_start_ever_firing(monkeypatc
     await a.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_omemo_initialized_is_a_redundant_readiness_trigger(monkeypatch):
+    """Regression: a production connection never reached readiness via
+    "session_bind" for reasons still under investigation, even though
+    auth/bind and OMEMO both demonstrably succeeded (OMEMO cannot initialize
+    without a working, bound stream). "omemo_initialized" is wired as an
+    independent, redundant trigger for the exact same readiness logic, so a
+    single point of failure in the session_bind path doesn't leave the
+    connection stuck "not ready" forever when OMEMO is enabled. This test
+    fires ONLY "omemo_initialized" — never "session_bind" — and readiness
+    must still be reached."""
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.1", omemo_enabled="true"))
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await a.connect()
+    assert ok is True
+    assert a._session_ready.is_set() is False
+
+    await a.client.fire("omemo_initialized")  # "session_bind" never fires
+    await a._connect_watchdog_task
+
+    assert a._session_ready.is_set() is True
+    assert a.has_fatal_error is False
+    await a.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_mark_session_ready_runs_housekeeping_only_once():
+    """Whichever of session_bind / omemo_initialized fires first must run
+    the post-connect housekeeping (send_presence, get_roster, ...); the
+    second trigger must be a no-op, not a duplicate run."""
+    a = adapter.XmppAdapter(_make_cfg())
+    a._session_ready = asyncio.Event()
+    client = MagicMock()
+    client.get_roster = AsyncMock(return_value=None)
+    a.client = client
+
+    await a._mark_session_ready()
+    await a._mark_session_ready()
+
+    # The broadcast presence() call (no args) happens exactly once — any
+    # additional calls are per-peer subscribe-request presence() sends.
+    broadcast_calls = [c for c in client.send_presence.call_args_list if c.args == () and c.kwargs == {}]
+    assert len(broadcast_calls) == 1
+    assert client.get_roster.await_count == 1
+
+
 # -----------------------------------------------------------------
 # Scoped per-JID lock
 # -----------------------------------------------------------------
@@ -355,6 +406,29 @@ async def test_disconnect_releases_lock(monkeypatch):
 
     await a.disconnect()
     assert release_calls == ["hermes@example.org"]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_does_not_force_cancel_connection_attempt(monkeypatch):
+    """Regression (reverted fix): disconnect() must NOT call
+    cancel_connection_attempt() on the underlying client. That was tried as
+    a fix for an orphaned handshake finishing late on an already
+    torn-down adapter, but forcibly cancelling a task mid-flight through
+    slixmpp's aiodns/pycares (c-ares) based DNS resolution correlated with
+    every subsequent connection attempt in the same process going
+    completely silent (no SASL, no bind at all) — a much worse outcome than
+    the rare late-arriving orphaned handshake it was meant to fix (which the
+    None-guards elsewhere already make harmless). Plain disconnect() is the
+    safer default."""
+    a = adapter.XmppAdapter(_make_cfg())
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await a.connect()
+    assert ok is True
+    client = a.client
+
+    await a.disconnect()
+    assert client.cancel_connection_attempt_calls == 0
 
 
 @pytest.mark.asyncio
@@ -531,6 +605,27 @@ async def test_session_ready_set_before_slow_get_roster():
         pass
 
 
+@pytest.mark.asyncio
+async def test_session_ready_set_even_if_send_presence_raises():
+    """Regression: a production connection never reached 'ready' despite
+    auth/bind and OMEMO succeeding, because _session_ready.set() sat AFTER
+    an unguarded self.client.send_presence() call — if that raised, slixmpp's
+    event dispatcher swallowed the exception and nothing after it (including
+    the readiness signal) ever ran. _session_ready.set() must be unconditional
+    and come before every other statement in this handler, not just before
+    the slow ones."""
+    a = adapter.XmppAdapter(_make_cfg())
+    a._session_ready = asyncio.Event()
+
+    client = MagicMock()
+    client.send_presence = MagicMock(side_effect=RuntimeError("boom"))
+    client.get_roster = AsyncMock(return_value=None)
+    a.client = client
+
+    await a._on_session_bind(None)  # must not raise, and must not skip readiness
+    assert a._session_ready.is_set() is True
+
+
 # -----------------------------------------------------------------
 # host/port passthrough
 # -----------------------------------------------------------------
@@ -659,9 +754,9 @@ def test_splits_long_messages_declared():
 # Connect-watchdog timeout: configurable, generous default
 # -----------------------------------------------------------------
 
-def test_connect_timeout_default_is_90s():
+def test_connect_timeout_default_is_180s():
     a = adapter.XmppAdapter(_make_cfg())
-    assert a._CONNECT_TIMEOUT_SECS == 90.0
+    assert a._CONNECT_TIMEOUT_SECS == 180.0
 
 
 def test_connect_timeout_overridable_via_extra_key():
@@ -677,7 +772,7 @@ def test_connect_timeout_overridable_via_env_var(monkeypatch):
 
 def test_connect_timeout_invalid_value_falls_back_to_default(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="not-a-number"))
-    assert a._CONNECT_TIMEOUT_SECS == 90.0
+    assert a._CONNECT_TIMEOUT_SECS == 180.0
 
 
 @pytest.mark.asyncio

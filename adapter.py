@@ -389,11 +389,22 @@ class XmppAdapter(BasePlatformAdapter):
     #   had already logged the connect as failed and moved on).
     #
     # Running this as a decoupled background task sidesteps both problems.
-    # 90s gives comfortable margin over a real-world report of "no client on
-    # this network takes more than 60s to connect." Overridable via
-    # XMPP_CONNECT_TIMEOUT_SECS / the connect_timeout_secs config key for
-    # servers slower still.
-    _CONNECT_TIMEOUT_SECS = 90.0
+    #
+    # 180s default: measured directly against a real, reproducible case where
+    # the handshake consistently took ~135s end-to-end (136.16s and 134.74s
+    # across two independent connects on a freshly booted machine, zero prior
+    # connection history). That signature — a fixed ~127-136s delay before
+    # the connection suddenly succeeds — matches a blackholed IPv6 route: DNS
+    # returns both an A and AAAA record, the IPv6 attempt gets silently
+    # dropped somewhere in the network path, the OS exhausts its default TCP
+    # SYN retry budget (Linux's default retry count sums to ~127-130s) before
+    # falling back to IPv4, which then succeeds immediately. Every smaller
+    # timeout tried before this (20s/25s/60s/90s/the operator's own 120s) was
+    # never going to be enough. Overridable via XMPP_CONNECT_TIMEOUT_SECS /
+    # the connect_timeout_secs config key — raise it further for an even
+    # slower network, or lower it once/if the underlying IPv6 routing issue
+    # is fixed (which would also make connects noticeably faster).
+    _CONNECT_TIMEOUT_SECS = 180.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
@@ -712,6 +723,25 @@ class XmppAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._closing = True
         if self.client is not None:
+            # NOTE: an earlier revision also called
+            # self.client.cancel_connection_attempt() here, to abort a
+            # still-in-flight handshake before calling disconnect() (slixmpp's
+            # own disconnect() only cancels the in-flight attempt when
+            # self.transport is already set). That was reverted: it
+            # correlated with connection attempts going completely silent
+            # (no SASL, no bind — nothing) on every subsequent retry in the
+            # same process, consistent with the well-known hazard of
+            # cancelling a task mid-flight through slixmpp's aiodns/pycares
+            # (c-ares) based DNS resolution, which can leave shared resolver
+            # state corrupted for the rest of the process. Raw TCP/STARTTLS
+            # connectivity from the same machine was independently confirmed
+            # fine via `openssl s_client`/`nc`, ruling out network/server
+            # causes. An orphaned handshake finishing late on an already
+            # torn-down adapter is a real but comparatively minor annoyance
+            # (the None-guards elsewhere already make it harmless); silently
+            # wedging every future connection attempt in the process is far
+            # worse, so plain disconnect() without forced cancellation is the
+            # safer default here.
             try:
                 self.client.disconnect()
             except Exception:
@@ -746,24 +776,55 @@ class XmppAdapter(BasePlatformAdapter):
             logger.exception("xmpp: process loop crashed")
 
     async def _on_session_bind(self, _jid: Any) -> None:
-        if self.client is None:
+        # Unconditional — logs even if self.client is somehow already None,
+        # so the next capture proves definitively whether slixmpp even
+        # invoked this handler (vs. the handler running but bailing out
+        # early, vs. never being invoked at all). A production connection
+        # was observed where this trigger appeared to silently never reach
+        # readiness despite bind/OMEMO succeeding; see _mark_session_ready
+        # for the omemo_initialized fallback added for the same reason.
+        logger.info("xmpp: session_bind event received (client set: %s)", self.client is not None)
+        await self._mark_session_ready()
+
+    async def _mark_session_ready(self) -> None:
+        """Signal readiness and run post-connect housekeeping, idempotently.
+
+        Called from BOTH "session_bind" and "omemo_initialized" — whichever
+        fires first wins, the other becomes a no-op via _session_established.
+        omemo_initialized is a deliberate redundant trigger: a production
+        connection was observed where session_bind's own readiness signal
+        never took effect (cause still under investigation) even though the
+        stream was fully authenticated and bound — proven by OMEMO
+        initializing successfully on that same connection, since OMEMO
+        cannot initialize without a working, bound stream. Relying on two
+        independent triggers means a single point of failure in either one
+        doesn't leave the connection stuck "not ready" forever.
+        """
+        if self.client is None or self._session_established:
             return
         self._session_established = True
-        self.client.send_presence()  # type: ignore[union-attr]
-        # Signal readiness NOW, before any of the housekeeping below. This
-        # event firing at all means the stream is authenticated and
-        # resource-bound — that's the actual definition of "connected" that
-        # _connect_watchdog / send_xmpp_message care about. get_roster(),
-        # MUC joins, and the presence-subscribe loop are best-effort
-        # post-connect housekeeping: any one of them being slow or hanging
-        # on a particular server must not delay (or, against a server that
-        # never answers a given IQ, indefinitely block) the readiness
-        # signal. A slow get_roster() IQ round-trip was observed in
-        # production stalling this exact signal for 80+ seconds after the
-        # SASL/bind handshake — and therefore OMEMO init — had already
-        # completed successfully.
+        # Signal readiness FIRST, before literally anything else in this
+        # method — including send_presence(). This being called at all means
+        # the stream is authenticated and resource-bound, which is the
+        # actual definition of "connected" that _connect_watchdog /
+        # send_xmpp_message care about. Every other statement below is
+        # best-effort post-connect housekeeping (send_presence, get_roster,
+        # MUC joins, subscribe loop, ad-hoc commands): each one is wrapped in
+        # its own try/except specifically so that NONE of them can prevent
+        # this signal from firing. A previous version of this fix put
+        # _session_ready.set() after an UNGUARDED send_presence() call — if
+        # that raised (observed in production: the readiness signal never
+        # fired even though bind/OMEMO succeeded, with slixmpp's own event
+        # dispatcher silently swallowing whatever send_presence() threw),
+        # nothing after it ever ran and the watchdog timed out a connection
+        # that had actually succeeded.
         if self._session_ready is not None:
             self._session_ready.set()
+        logger.info("xmpp: marking session ready")
+        try:
+            self.client.send_presence()  # type: ignore[union-attr]
+        except Exception:
+            logger.exception("xmpp: initial send_presence() failed")
         try:
             await self.client.get_roster()  # type: ignore[union-attr]
         except Exception:
@@ -848,6 +909,8 @@ class XmppAdapter(BasePlatformAdapter):
         logger.info("OMEMO: initialized")
         self._omemo_initialized_occurred = True
         self._omemo_initialized.set()
+        # Redundant readiness trigger — see _mark_session_ready's docstring.
+        await self._mark_session_ready()
 
     # -----------------------------------------------------------------
     # Inbound
