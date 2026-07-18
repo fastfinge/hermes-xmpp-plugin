@@ -13,6 +13,36 @@ Packaged as a third-party Hermes platform plugin.
 """
 from __future__ import annotations
 
+# Self-healing deps: slixmpp + aiohttp + slixmpp-omemo + omemo. These get wiped
+# on every `hermes update` because the host pyproject's [all] extra doesn't
+# list them and this plugin ships no extra of its own. See
+# ~/.hermes/plugins/_shared/lazy_install.py for the install logic.
+#
+# We probe slixmpp first; if it's missing we install all four, because the
+# `from slixmpp...` imports below would otherwise raise ImportError and break
+# the whole adapter module (and the gateway with it).
+try:
+    import sys as _sys, os as _os
+    _sys.path.insert(
+        0,
+        _os.path.expanduser("~/.hermes/plugins/_shared"),
+    )
+    from lazy_install import ensure as _hermes_lazy_ensure
+
+    _XMPP_LAZY_OK = _hermes_lazy_ensure(
+        "hermes-xmpp",
+        pip_specs=(
+            "slixmpp==1.15.0",
+            "aiohttp==3.13.4",
+            "slixmpp-omemo",
+            "omemo",
+        ),
+        imports=("slixmpp", "aiohttp", "slixmpp_omemo", "omemo"),
+    )
+except Exception:  # noqa: BLE001 — bootstrap must never crash plugin load
+    _XMPP_LAZY_OK = False
+
+
 import asyncio
 import json
 import logging
@@ -22,6 +52,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if not _XMPP_LAZY_OK:
+    # We can't continue — the imports below are required for the adapter to
+    # even parse. Surface a clear error rather than a cryptic ImportError
+    # deep in the gateway boot path.
+    raise ImportError(
+        "hermes-xmpp-plugin: required dependencies (slixmpp, aiohttp, "
+        "slixmpp-omemo, omemo) are not installed and auto-install failed. "
+        "Install manually: "
+        "uv pip install 'slixmpp==1.15.0' 'aiohttp==3.13.4' slixmpp-omemo omemo"
+    )
 
 from slixmpp.clientxmpp import ClientXMPP
 from slixmpp.jid import JID  # type: ignore[import-untyped]
@@ -177,8 +218,24 @@ if SLIXMPP_OMEMO_AVAILABLE:
             manager so existing Conversations/Gajim-style devices can still
             decrypt instead of getting a useless "message from myself" blob.
             """
+            # Heal a previously cancelled/failed cached init task BEFORE
+            # awaiting it. CancelledError is a BaseException in py3.8+, so the
+            # `except Exception` below never catches it — a single timed-out
+            # cron delivery that cancels the shared init task would otherwise
+            # poison OMEMO (sends + decrypts) until a full gateway restart.
+            # Observed in the wild 2026-07-18.
+            self._heal_cancelled_session_manager_task()
             try:
-                return await super().get_session_manager()  # type: ignore[misc]
+                # Shield the shared init from caller cancellation: a timed-out
+                # delivery must abort ITS send, not kill the one init task
+                # every other send/decrypt is waiting on.
+                return await asyncio.shield(super().get_session_manager())  # type: ignore[misc]
+            except asyncio.CancelledError:
+                # Our caller was cancelled, or the cached task was already
+                # cancelled. Clear the cache so the NEXT call can re-init,
+                # then propagate the cancellation.
+                self._heal_cancelled_session_manager_task()
+                raise
             except Exception as exc:
                 self._reset_failed_session_manager()
                 if "urn:xmpp:omemo:2" in str(exc):
@@ -195,6 +252,29 @@ if SLIXMPP_OMEMO_AVAILABLE:
                         self._reset_failed_session_manager()
                         logger.exception("OMEMO: legacy fallback initialization failed")
                 raise
+
+        def _heal_cancelled_session_manager_task(self) -> None:
+            """Clear the cached OMEMO init task if it already died.
+
+            slixmpp-omemo caches its init task forever. If that task finished
+            in a cancelled or failed state, every future get_session_manager()
+            re-awaits the same corpse and re-raises CancelledError, which the
+            Exception-based recovery path never sees. Only a DONE task in a
+            bad state is cleared — a still-running init is left alone so
+            concurrent callers keep sharing it.
+            """
+            task = getattr(self, "_XEP_0384__session_manager_task", None)
+            if task is None or not getattr(task, "done", lambda: True)():
+                return
+            failed = task.cancelled() or (task.exception() is not None)
+            if failed:
+                logger.warning(
+                    "OMEMO: cached session manager init task is dead "
+                    "(cancelled=%s); resetting so next use re-initializes",
+                    task.cancelled(),
+                )
+                setattr(self, "_XEP_0384__session_manager_task", None)
+                setattr(self, "_XEP_0384__session_manager", None)
 
         def _reset_failed_session_manager(self) -> None:
             task = getattr(self, "_XEP_0384__session_manager_task", None)
@@ -308,11 +388,15 @@ class XmppAdapter(BasePlatformAdapter):
 
         # OMEMO
         omemo_cfg = extra.get("omemo", {})
-        self._omemo_enabled: bool = bool(
-            omemo_cfg.get("enabled")
-            if isinstance(omemo_cfg, dict) and "enabled" in omemo_cfg
-            else extra.get("omemo_enabled", os.getenv("XMPP_OMEMO_ENABLED", "true"))
-        )
+        # Coerce via _truthy so string values from env/config ("False", "0",
+        # "no") are honoured. Plain bool(str) treats any non-empty string as
+        # True, which silently ignored XMPP_OMEMO_ENABLED=False (issue #5).
+        if isinstance(omemo_cfg, dict) and "enabled" in omemo_cfg:
+            self._omemo_enabled: bool = _truthy(omemo_cfg.get("enabled"))
+        else:
+            self._omemo_enabled = _truthy(
+                extra.get("omemo_enabled", os.getenv("XMPP_OMEMO_ENABLED", "true"))
+            )
         self._omemo_storage_path: str = str(
             (omemo_cfg.get("storage_path") if isinstance(omemo_cfg, dict) else None)
             or extra.get("omemo_storage_path")
