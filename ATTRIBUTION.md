@@ -9,6 +9,11 @@ Primary implementation source:
   "feat(gateway): add XMPP/Jabber platform adapter". Most of the adapter design
   and implementation here is derived from that PR: slixmpp adapter, MUC handling,
   STARTTLS posture, XEP-0363 uploads, standalone send helper, tests, and docs.
+  Later revisions of #17469 (through 2026-07-13) also fixed a set of connection-
+  reliability issues — a bounded wait for session establishment, a scoped
+  per-account connection lock, `failed_all_auth` handling, direct-TLS (XEP-0368)
+  support, and corrected `send_voice`/`send_document`/`send_video` parameter
+  names — that are ported into this plugin as well.
 
 Related prior work reviewed and credited:
 

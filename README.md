@@ -65,6 +65,7 @@ XMPP_ALLOWED_USERS=sam@example.org
 # Optional:
 XMPP_HOST=example.org
 XMPP_PORT=5222
+# XMPP_DIRECT_TLS=true   # force XEP-0368 direct TLS; auto-on when XMPP_PORT=5223
 XMPP_MUC_ROOMS=room@conference.example.org/hermes
 XMPP_MUC_NICK=hermes
 XMPP_HOME_CHANNEL=sam@example.org
@@ -159,7 +160,12 @@ supporting XEP-0444, XEP-0461, and XEP-0394.
 ## Troubleshooting
 
 - `xmpp_auth_failed`: wrong JID/password, or server auth policy issue.
-- `xmpp_connect_failed`: DNS/firewall/SRV issue; try `XMPP_HOST`.
+- `xmpp_connect_timeout`: session didn't establish within 20s — DNS/firewall/SRV
+  issue; try `XMPP_HOST`/`XMPP_PORT`, or check the server is reachable.
+- `xmpp_connection_lost`: an established session dropped unexpectedly (server
+  restart, network blip); the gateway's reconnect watcher should retry.
+- `xmpp_lock`: another gateway process is already logged into this JID; stop
+  it first, or use a separate bot account per gateway.
 - HTTP upload failure: enable XEP-0363 on the server and check max file size.
 - DM rejected: add your bare JID to `XMPP_ALLOWED_USERS`.
 - MUC silent: add room to `XMPP_MUC_ROOMS` and invite the bot.

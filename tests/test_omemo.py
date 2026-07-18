@@ -124,6 +124,78 @@ def test_omemo_values_surface_in_extra():
 
 
 # ------------------------------------------------------------------
+# omemo_enabled truthiness parsing (issue #5: XMPP_OMEMO_ENABLED=False was
+# silently ignored because `bool("False")` is True for any non-empty string —
+# fixed by routing every source (env var, extra["omemo_enabled"],
+# extra["omemo"]["enabled"]) through _truthy()).
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("False", False),
+        ("false", False),
+        ("FALSE", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        ("", False),
+        ("True", True),
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+    ],
+)
+def test_omemo_enabled_env_var_string_truthiness(monkeypatch, raw, expected):
+    monkeypatch.setenv("XMPP_JID", "bot@example.org")
+    monkeypatch.setenv("XMPP_PASSWORD", "secret")
+    monkeypatch.setenv("XMPP_OMEMO_ENABLED", raw)
+    a = adapter.XmppAdapter(Config())
+    assert a._omemo_enabled is expected
+
+
+@pytest.mark.parametrize("raw,expected", [("False", False), ("True", True), ("0", False), ("1", True)])
+def test_omemo_enabled_extra_omemo_enabled_key_truthiness(monkeypatch, raw, expected):
+    monkeypatch.delenv("XMPP_OMEMO_ENABLED", raising=False)
+    a = adapter.XmppAdapter(Config(extra={
+        "jid": "bot@example.org",
+        "password": "secret",
+        "omemo_enabled": raw,
+    }))
+    assert a._omemo_enabled is expected
+
+
+@pytest.mark.parametrize("raw,expected", [("False", False), ("True", True), (False, False), (True, True)])
+def test_omemo_enabled_nested_omemo_dict_truthiness(monkeypatch, raw, expected):
+    monkeypatch.delenv("XMPP_OMEMO_ENABLED", raising=False)
+    a = adapter.XmppAdapter(Config(extra={
+        "jid": "bot@example.org",
+        "password": "secret",
+        "omemo": {"enabled": raw},
+    }))
+    assert a._omemo_enabled is expected
+
+
+def test_omemo_disabled_env_var_means_no_plugin_registration(monkeypatch):
+    """End-to-end guard for issue #5: with OMEMO disabled, connect() must never
+    register xep_0384 — otherwise encryption could still kick in despite the
+    operator explicitly opting out."""
+    monkeypatch.setenv("XMPP_JID", "bot@example.org")
+    monkeypatch.setenv("XMPP_PASSWORD", "secret")
+    monkeypatch.setenv("XMPP_OMEMO_ENABLED", "False")
+    a = adapter.XmppAdapter(Config())
+    assert a._omemo_enabled is False
+
+    # Simulate the plugin-registration branch in connect() directly rather
+    # than standing up a real slixmpp client: it's gated purely on
+    # _omemo_enabled, so this reproduces the exact condition connect() checks.
+    would_register_omemo = a._omemo_enabled and adapter.SLIXMPP_OMEMO_AVAILABLE
+    assert would_register_omemo is False
+
+
+# ------------------------------------------------------------------
 # Session-manager recovery
 # ------------------------------------------------------------------
 

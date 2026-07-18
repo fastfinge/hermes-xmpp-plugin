@@ -13,6 +13,70 @@ All notable changes to this project will be documented in this file.
   is configurable via the `max_message_length` config key or the
   `XMPP_MAX_MESSAGE_LENGTH` env var. The adapter now exposes `MAX_MESSAGE_LENGTH`
   so the host's streaming consumer chunks against the same value.
+- **Direct TLS (XEP-0368)**: auto-enabled when `XMPP_PORT=5223`, overridable
+  either way via `XMPP_DIRECT_TLS` / the `direct_tls` config key. STARTTLS
+  remains the port-5222 default; plaintext is refused in every configuration.
+- **Scoped per-account connection lock**: `connect()` now takes a lock on the
+  normalized bare JID (matching the pattern used elsewhere in Hermes) so two
+  gateways can't both log into the same XMPP account and double-handle every
+  inbound stanza. The one-shot cron/`send_message` sender deliberately skips
+  it — it attaches as a short-lived second resource, which XMPP permits.
+- **Presence-subscription auto-approval**: inbound subscription requests from
+  allow-listed peers are approved and subscribed back automatically, so OMEMO
+  device-list PEP updates reach the peer's client (this is what clears a
+  stale "no OMEMO for this contact" cache).
+- `splits_long_messages = True` is now declared on the adapter so a host
+  gateway that checks it can skip pre-truncating cron/delivery output before
+  `send()` ever sees it.
+
+### Fixed
+
+- **`XMPP_OMEMO_ENABLED=False` is honored** (issue #5). `omemo_enabled` /
+  `XMPP_OMEMO_ENABLED` — whether set via env var, `extra["omemo_enabled"]`, or
+  the nested `extra["omemo"]["enabled"]` config key — is now parsed with a
+  `_truthy()` helper everywhere instead of `bool(str)`. Plain `bool("False")`
+  is `True` for any non-empty string, so setting `XMPP_OMEMO_ENABLED=False` in
+  `.env` was silently ignored and OMEMO stayed on.
+- `connect()` now waits (bounded, 20s) for the XMPP session to actually
+  establish before reporting success, and sets a retryable fatal error on
+  timeout. Previously it reported "connected" as soon as `client.connect()`
+  returned a Future, so an unreachable server, wrong host, or rejected login
+  left the gateway believing XMPP was up over a dead socket.
+- `connect()` no longer silently drops `XMPP_HOST`/`XMPP_PORT` on a fallback
+  path. The old code called `client.connect(address=(host, port))`, which
+  isn't a valid slixmpp kwarg — it always raised `TypeError` and fell through
+  to a bare `client.connect()`, sending the bot to SRV/JID-domain lookup
+  instead of the configured server.
+- Auth failure now reacts to `failed_all_auth` (fired once, after every SASL
+  mechanism the server offered has been exhausted) instead of `failed_auth`
+  (fired per rejected mechanism). Reacting to `failed_auth` marked the
+  adapter dead even when a later mechanism succeeded, silently poisoning a
+  working connection.
+- An unexpected mid-session disconnect (server restart, network blip) now
+  escalates to a retryable fatal error and notifies the host gateway, so its
+  reconnect watcher actually retries. Previously the adapter just marked
+  itself disconnected with nothing driving recovery — a silently dead bridge
+  in an otherwise-healthy gateway.
+- `send_voice`/`send_document`/`send_video` now accept the same keyword
+  argument names (`audio_path`/`file_path`/`video_path`) the host gateway
+  calls them with (e.g. `cron/scheduler.py`). The previous `path` parameter
+  name raised `TypeError` on every keyword call, so cron/scheduled media
+  attachments never sent.
+- `xep_0380` (Explicit Message Encryption hint) is now registered as a
+  slixmpp plugin. The EME-hint code in `_send_encrypted_one`/`edit_message`
+  already checked for it, but it was never added to the plugin registration
+  list, so the hint silently never fired.
+- Fixed `enable_starttls`/`enable_direct_tls`/`enable_plaintext` being the
+  actual TLS-posture attributes current slixmpp reads. The previous
+  `use_starttls`/`force_starttls` names don't exist on the pinned slixmpp
+  version, so that code was a no-op (harmless only because slixmpp's own
+  default already refuses plaintext).
+- `send_xmpp_message()`'s connect-failure path called `fatal_error_message()`
+  as a method; it's a property on the host's `BasePlatformAdapter`, so this
+  raised `TypeError` instead of surfacing the real error message.
+- Bumped the `aiohttp` pin to 3.14.1 (CVE-2026-34993 `CookieJar.load`
+  deserialization; CVE-2026-54273/54274/54280 DoS via unbounded pipelining,
+  oversized websocket frames, and unclosed payloads on mid-write disconnect).
 
 ## [0.3.0] — First-class XMPP
 

@@ -13,34 +13,44 @@ Packaged as a third-party Hermes platform plugin.
 """
 from __future__ import annotations
 
-# Self-healing deps: slixmpp + aiohttp + slixmpp-omemo + omemo. These get wiped
-# on every `hermes update` because the host pyproject's [all] extra doesn't
-# list them and this plugin ships no extra of its own. See
-# ~/.hermes/plugins/_shared/lazy_install.py for the install logic.
+# Hard dependency: slixmpp itself (the `from slixmpp...` imports below would
+# otherwise raise ImportError and break the whole adapter module, and the
+# gateway with it). Only `slixmpp` is checked here — `aiohttp` is a
+# transitive dep slixmpp's own XEP-0363 plugin pulls in, and slixmpp-omemo /
+# omemo are optional (the adapter already degrades to TLS-only when they're
+# missing; see SLIXMPP_OMEMO_AVAILABLE below).
 #
-# We probe slixmpp first; if it's missing we install all four, because the
-# `from slixmpp...` imports below would otherwise raise ImportError and break
-# the whole adapter module (and the gateway with it).
+# Most installs get slixmpp from this plugin's requirements.txt (see
+# README.md: `uv pip install -r requirements.txt`) and never hit anything
+# below. The self-heal path is opt-in local infrastructure some operators
+# run to survive `hermes update` wiping third-party plugin deps — it is
+# NOT part of this repo and does not exist on a fresh install, so its
+# absence must never be treated as a fatal error.
 try:
-    import sys as _sys, os as _os
-    _sys.path.insert(
-        0,
-        _os.path.expanduser("~/.hermes/plugins/_shared"),
-    )
-    from lazy_install import ensure as _hermes_lazy_ensure
+    import slixmpp as _slixmpp_probe  # noqa: F401
+    _XMPP_DEPS_OK = True
+except ImportError:
+    _XMPP_DEPS_OK = False
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.expanduser("~/.hermes/plugins/_shared"))
+        from lazy_install import ensure as _hermes_lazy_ensure
 
-    _XMPP_LAZY_OK = _hermes_lazy_ensure(
-        "hermes-xmpp",
-        pip_specs=(
-            "slixmpp==1.15.0",
-            "aiohttp==3.13.4",
-            "slixmpp-omemo",
-            "omemo",
-        ),
-        imports=("slixmpp", "aiohttp", "slixmpp_omemo", "omemo"),
-    )
-except Exception:  # noqa: BLE001 — bootstrap must never crash plugin load
-    _XMPP_LAZY_OK = False
+        _XMPP_DEPS_OK = _hermes_lazy_ensure(
+            "hermes-xmpp",
+            pip_specs=(
+                "slixmpp==1.15.0",
+                # CVE-2026-34993 (CookieJar.load deserialization, fixed 3.14.0) +
+                # CVE-2026-54273/54274/54280 (DoS via unbounded pipelining/websocket
+                # frames/unclosed payloads, fixed 3.14.1).
+                "aiohttp==3.14.1",
+                "slixmpp-omemo",
+                "omemo",
+            ),
+            imports=("slixmpp", "aiohttp", "slixmpp_omemo", "omemo"),
+        )
+    except Exception:  # noqa: BLE001 — the self-heal hook is optional; never fatal on its own
+        _XMPP_DEPS_OK = False
 
 
 import asyncio
@@ -53,15 +63,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-if not _XMPP_LAZY_OK:
+if not _XMPP_DEPS_OK:
     # We can't continue — the imports below are required for the adapter to
     # even parse. Surface a clear error rather than a cryptic ImportError
     # deep in the gateway boot path.
     raise ImportError(
-        "hermes-xmpp-plugin: required dependencies (slixmpp, aiohttp, "
-        "slixmpp-omemo, omemo) are not installed and auto-install failed. "
-        "Install manually: "
-        "uv pip install 'slixmpp==1.15.0' 'aiohttp==3.13.4' slixmpp-omemo omemo"
+        "hermes-xmpp-plugin: slixmpp is not installed. Install with: "
+        "uv pip install -r requirements.txt (from the plugin directory), or: "
+        "uv pip install 'slixmpp==1.15.0' 'aiohttp==3.14.1' slixmpp-omemo omemo"
     )
 
 from slixmpp.clientxmpp import ClientXMPP
@@ -351,6 +360,17 @@ class XmppAdapter(BasePlatformAdapter):
     # and the adapter's own send paths chunk against it too.
     MAX_MESSAGE_LENGTH = 10000
 
+    # send() chunks via _chunk_body(MAX_MESSAGE_LENGTH); declaring this lets a
+    # host gateway that checks it skip pre-truncating cron/delivery output
+    # before send() ever sees it.
+    splits_long_messages = True
+
+    # How long connect() waits for the session to establish before declaring a
+    # retryable failure. Keep under the gateway's own per-platform connect
+    # timeout (typically ~30s) so our diagnosis (bad host, rejected login)
+    # wins over a generic gateway-level timeout.
+    _CONNECT_TIMEOUT_SECS = 20.0
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
         extra = config.extra or {}
@@ -375,6 +395,22 @@ class XmppAdapter(BasePlatformAdapter):
         self._password: str = str(extra.get("password") or os.getenv("XMPP_PASSWORD", ""))
         self.host: Optional[str] = extra.get("host") or os.getenv("XMPP_HOST") or None
         self.port: int = int(extra.get("port") or os.getenv("XMPP_PORT", 5222))
+
+        # Direct TLS ("TLS from byte one", XEP-0368 — the classic port-5223
+        # posture). Auto-enabled when the operator points us at port 5223,
+        # overridable either way via XMPP_DIRECT_TLS / direct_tls. slixmpp
+        # falls back to STARTTLS if the direct-TLS attempt fails, and
+        # plaintext stays refused in every configuration.
+        _direct_raw = str(
+            extra.get("direct_tls") or os.getenv("XMPP_DIRECT_TLS", "")
+        ).strip().lower()
+        if _direct_raw in ("1", "true", "yes", "on"):
+            self.direct_tls: bool = True
+        elif _direct_raw in ("0", "false", "no", "off"):
+            self.direct_tls = False
+        else:
+            self.direct_tls = self.port == 5223
+
         self.muc_nick: str = extra.get("muc_nick") or os.getenv("XMPP_MUC_NICK") or self._default_nick()
         self.muc_rooms: List[_MucRoom] = _parse_muc_rooms(
             str(extra.get("muc_rooms") or os.getenv("XMPP_MUC_ROOMS", "")), self.muc_nick
@@ -405,10 +441,20 @@ class XmppAdapter(BasePlatformAdapter):
         self._omemo_initialized = asyncio.Event()
         self._omemo_initialized_occurred = False
 
+        # True only for the one-shot send_xmpp_message() path: connect as an
+        # ephemeral second resource without taking (or releasing) the
+        # per-account scoped lock held by the running gateway.
+        self._ephemeral_sender = False
+
         # Lazy state
         self.client: Optional[Any] = None
         self._process_task: Optional[asyncio.Task] = None
         self._session_ready: Optional[asyncio.Event] = None
+        self._session_established = False
+        # Set while disconnect() is tearing the client down on purpose, so
+        # the "disconnected" handler doesn't mistake a deliberate close for
+        # an outage and escalate it to a reconnect (#28919).
+        self._closing = False
         self._self_bare = self._bare(self.jid)
         self._known_mucs = {r.room for r in self.muc_rooms}
         # Bare JIDs we have observed sending us 1:1 ("chat") messages. Used to
@@ -431,12 +477,36 @@ class XmppAdapter(BasePlatformAdapter):
         # the gateway's reconnect watcher (gateway/run.py) rebuilds a fresh
         # adapter after a fatal error and calls ``connect(is_reconnect=True)``.
         # The adapter MUST accept the kwarg or that recovery path raises
-        # TypeError and XMPP can never reconnect. We currently build a fresh
-        # slixmpp client every call, so the flag is accepted but not used.
+        # TypeError and XMPP can never reconnect. XMPP keeps no client-side
+        # offline queue (the server stores offline messages), so there is
+        # nothing extra to preserve on a watcher-driven reconnect — we accept
+        # the flag and connect normally with a fresh slixmpp client.
         del is_reconnect
+        self._closing = False
+        self._session_established = False
+
+        # One gateway per account: two adapters logged into the same JID both
+        # receive inbound stanzas (the server fans out by resource), so every
+        # message would be handled twice. Lock on the normalized bare JID —
+        # localpart/domain are case-insensitive. A same-process reacquire
+        # succeeds, so watcher-driven reconnects pass. Released from
+        # disconnect(), which every failed-connect path below goes through.
+        # The one-shot cron sender (send_xmpp_message) skips this: it attaches
+        # as a short-lived second resource, which XMPP permits by design.
+        if not self._ephemeral_sender:
+            lock_jid = self._bare(self.jid).lower()
+            if not self._acquire_platform_lock(
+                "xmpp", lock_jid, f"XMPP account {lock_jid}"
+            ):
+                # The base helper leaves the identity set on failure; clear it
+                # so a later disconnect() from this never-connected adapter
+                # can't release a lock owned by a same-PID profile.
+                self._platform_lock_identity = None
+                return False
+
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0203", "xep_0363"):
+        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0203", "xep_0363", "xep_0380"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -473,9 +543,14 @@ class XmppAdapter(BasePlatformAdapter):
                 "Install with: uv pip install slixmpp-omemo omemo"
             )
 
-        # TLS
-        client.use_starttls = True  # type: ignore[attr-defined,reportAttributeAccessIssue]
-        client.force_starttls = True  # type: ignore[attr-defined,reportAttributeAccessIssue]
+        # Enforce TLS, refuse plaintext. ``enable_plaintext = False`` is the
+        # load-bearing knob current slixmpp actually reads (its default is
+        # already False, but we set it explicitly rather than rely on that).
+        # ``enable_direct_tls`` follows the direct-TLS config (auto-on for
+        # port 5223) with STARTTLS kept available as a fallback.
+        client.enable_starttls = True  # type: ignore[attr-defined,reportAttributeAccessIssue]
+        client.enable_direct_tls = self.direct_tls  # type: ignore[attr-defined,reportAttributeAccessIssue]
+        client.enable_plaintext = False  # type: ignore[attr-defined,reportAttributeAccessIssue]
 
         client.add_event_handler("session_start", self._on_session_start)
         # slixmpp dispatches MUC stanzas to BOTH "message" and
@@ -484,29 +559,71 @@ class XmppAdapter(BasePlatformAdapter):
         # already covers private (chat/normal) and groupchat stanzas.
         client.add_event_handler("message", self._on_message)
         client.add_event_handler("disconnected", self._on_disconnected)
-        client.add_event_handler("failed_auth", self._on_failed_auth)
+        # Handle "failed_all_auth" (fired once, after every SASL mechanism the
+        # server offered has been exhausted) rather than "failed_auth" (fired
+        # once per *rejected* mechanism). slixmpp moves on to the next
+        # mechanism after each failed_auth, so reacting to failed_auth marks
+        # the adapter dead even when a later mechanism (e.g. SCRAM after a
+        # rejected PLAIN) succeeds — silently poisoning a working connection
+        # (#28919).
+        client.add_event_handler("failed_all_auth", self._on_failed_all_auth)
+
+        # Presence subscriptions. slixmpp's blanket auto_authorize would
+        # approve *anyone*; gate on the allow-list instead so an unauthorized
+        # JID can't force a roster entry. auto_subscribe stays off — we send
+        # our own subscribe-back only to approved peers so the subscription
+        # is mutual (required for OMEMO device-list PEP pushes to reach the
+        # peer's client and clear its stale "no OMEMO" cache).
+        client.roster.auto_authorize = False
+        client.roster.auto_subscribe = False
+        client.add_event_handler("presence_subscribe", self._on_subscribe)
 
         self.client = client
         self._session_ready = asyncio.Event()
         self._omemo_initialized.clear()
         self._omemo_initialized_occurred = False
 
-        connect_kwargs: Dict[str, Any] = {}
+        # slixmpp >=1.x uses ``connect(host, port)``; try the modern signature
+        # first and fall back WITHOUT dropping the configured host/port — the
+        # old ``connect(address=(host, port))`` fallback silently discarded
+        # XMPP_HOST/XMPP_PORT (unknown kwarg → TypeError → bare connect()),
+        # sending the bot to SRV/JID-domain instead of the operator's server.
         if self.host:
-            connect_kwargs["address"] = (self.host, self.port)
-
-        try:
-            ok = client.connect(**connect_kwargs)
-        except TypeError:
-            ok = client.connect()
-        if ok is False:
-            self._set_fatal_error(
-                "xmpp_connect_failed", "XMPP connect() returned False", retryable=True
-            )
-            return False
+            try:
+                client.connect(host=self.host, port=self.port)
+            except TypeError:
+                client.connect(address=(self.host, self.port))
+        else:
+            client.connect()
 
         loop = asyncio.get_event_loop()
         self._process_task = loop.create_task(self._run_process())
+
+        # ``connect()`` only kicks off the TCP/TLS/SASL handshake (slixmpp
+        # returns a Future, never a bool — there is no synchronous failure to
+        # check here). Wait, bounded, for the session to actually establish
+        # before reporting success. Otherwise an unreachable server, a wrong
+        # host, or a rejected login would leave the gateway believing XMPP is
+        # connected over a dead socket with nothing driving recovery (#28919).
+        try:
+            await asyncio.wait_for(
+                self._session_ready.wait(), timeout=self._CONNECT_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            if not self.has_fatal_error:
+                self._set_fatal_error(
+                    "xmpp_connect_timeout",
+                    f"XMPP session did not establish within "
+                    f"{self._CONNECT_TIMEOUT_SECS:g}s — check XMPP_HOST/XMPP_PORT "
+                    "and server reachability",
+                    retryable=True,
+                )
+            await self.disconnect()
+            return False
+        if self.has_fatal_error:
+            # e.g. failed_all_auth fired (bad credentials) while we waited.
+            await self.disconnect()
+            return False
 
         if omemo_ok:
             logger.info("XMPP adapter: OMEMO enabled (storage: %s)", self._omemo_storage_path)
@@ -519,6 +636,7 @@ class XmppAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._closing = True
         if self.client is not None:
             try:
                 self.client.disconnect()
@@ -528,6 +646,7 @@ class XmppAdapter(BasePlatformAdapter):
             self._process_task.cancel()
             self._process_task = None
         self.client = None
+        self._release_platform_lock()
         self._mark_disconnected()
 
     async def _run_process(self) -> None:
@@ -551,6 +670,7 @@ class XmppAdapter(BasePlatformAdapter):
     async def _on_session_start(self, _event: Any) -> None:
         if self.client is None:
             return
+        self._session_established = True
         self.client.send_presence()  # type: ignore[union-attr]
         try:
             await self.client.get_roster()  # type: ignore[union-attr]
@@ -561,6 +681,16 @@ class XmppAdapter(BasePlatformAdapter):
                 self.client.plugin["xep_0045"].join_muc(room.room, room.nick or self.muc_nick)  # type: ignore[union-attr]
             except Exception:
                 logger.exception("xmpp: failed to join MUC %s", room.room)
+        # Proactively request a presence subscription to each allow-listed
+        # peer. A mutual subscription is what makes the peer's client receive
+        # our OMEMO device-list PEP updates (and clears a stale "no OMEMO for
+        # this contact" cache); it also lets us see their presence. Only bare
+        # JIDs we already trust get an unsolicited request.
+        for jid in self.allowed_users:
+            try:
+                self.client.send_presence(pto=jid, ptype="subscribe")  # type: ignore[union-attr]
+            except Exception:
+                logger.debug("xmpp: subscribe request to %s failed", jid, exc_info=True)
         if self._session_ready is not None:
             self._session_ready.set()
         # Register ad-hoc commands now that session is active
@@ -569,15 +699,60 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("xmpp: ad-hoc command setup failed", exc_info=True)
 
-    async def _on_disconnected(self, _event: Any) -> None:
-        self._mark_disconnected()
+    async def _on_subscribe(self, presence: Any) -> None:
+        """Approve an inbound presence-subscription request from an allowed peer.
 
-    async def _on_failed_auth(self, _event: Any) -> None:
+        Runs the same allow-list gate as inbound messages, so only trusted
+        JIDs get into the bot's roster. On approval we also subscribe back
+        (if not already) so the subscription is mutual and our OMEMO
+        device-list updates push to the peer's client.
+        """
+        if self.client is None:
+            return
+        try:
+            requester = self._bare(str(presence.get_from()))
+        except Exception:
+            return
+        if not (self.allow_all_users or requester in self.allowed_users):
+            logger.debug("xmpp: ignoring subscription request from %s (not allowed)", requester)
+            return
+        try:
+            self.client.send_presence(pto=requester, ptype="subscribed")
+            self.client.send_presence(pto=requester, ptype="subscribe")
+            logger.info("xmpp: approved presence subscription for %s", requester)
+        except Exception:
+            logger.debug("xmpp: failed to approve subscription for %s", requester, exc_info=True)
+
+    async def _on_disconnected(self, _event: Any) -> None:
+        self._session_established = False
+        # A deliberate disconnect(), or a failure we have already reported
+        # (e.g. failed_all_auth set a fatal error), needs no escalation —
+        # just record the disconnect and let the existing status stand.
+        if self._closing or self.has_fatal_error:
+            self._mark_disconnected()
+            return
+        # An unexpected drop of a live connection (server restart, network
+        # blip, ...). Escalate to a *retryable* fatal error AND notify the
+        # gateway so its reconnect watcher actually retries. Marking the
+        # adapter disconnected without notifying would leave the platform
+        # down with nothing driving a reconnect — a silently dead bridge in
+        # an otherwise-healthy gateway (#28919).
+        self._set_fatal_error(
+            "xmpp_connection_lost", "XMPP connection lost", retryable=True
+        )
+        await self._notify_fatal_error()
+
+    async def _on_failed_all_auth(self, _event: Any) -> None:
+        # Every SASL mechanism the server offered has been rejected —
+        # credentials are wrong or the account is disabled. Non-retryable,
+        # and we notify the gateway so the failure actually surfaces instead
+        # of leaving a connected-looking but dead adapter (#28919).
         self._set_fatal_error(
             "xmpp_auth_failed",
             "XMPP authentication failed — check XMPP_JID/XMPP_PASSWORD",
             retryable=False,
         )
+        await self._notify_fatal_error()
 
     async def _on_omemo_initialized(self, _event: Any) -> None:
         logger.info("OMEMO: initialized")
@@ -1157,20 +1332,25 @@ class XmppAdapter(BasePlatformAdapter):
     async def send_document(
         self,
         chat_id: str,
-        path: str,
+        file_path: str,
         caption: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        return await self._upload_and_send(chat_id, path, caption)
+        # Param name must match BasePlatformAdapter.send_document(file_path=...)
+        # — the gateway calls these by keyword (cron/scheduler.py:
+        # send_document(chat_id=..., file_path=...)), so a renamed positional
+        # arg raises TypeError and the attachment silently never sends.
+        return await self._upload_and_send(chat_id, file_path, caption)
 
     async def send_video(
         self,
         chat_id: str,
-        path: str,
+        video_path: str,
         caption: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        return await self._upload_and_send(chat_id, path, caption)
+        # Param name must match BasePlatformAdapter.send_video(video_path=...).
+        return await self._upload_and_send(chat_id, video_path, caption)
 
     async def _upload_and_send(
         self, chat_id: str, path: str, caption: Optional[str]
@@ -1401,18 +1581,22 @@ class XmppAdapter(BasePlatformAdapter):
     async def send_voice(
         self,
         chat_id: str,
-        path: str,
+        audio_path: str,
         **kwargs,
     ) -> SendResult:
+        # Param name must match BasePlatformAdapter.send_voice(audio_path=...)
+        # — cron/scheduler.py calls send_voice(chat_id=..., audio_path=...) by
+        # keyword, so a renamed positional arg raises TypeError and the
+        # attachment silently never sends.
         if self.client is None or not getattr(self, "_running", True):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
         if "xep_0447" not in self._registered_plugins or "xep_0363" not in self._registered_plugins:
-            return await self._upload_and_send(chat_id, path, caption=None)
+            return await self._upload_and_send(chat_id, audio_path, caption=None)
 
-        content_type, _ = mimetypes.guess_type(path)
+        content_type, _ = mimetypes.guess_type(audio_path)
         upload_kwargs: Dict[str, Any] = {
-            "filename": Path(path).name,
-            "input_file": path,
+            "filename": Path(audio_path).name,
+            "input_file": audio_path,
         }
         if content_type:
             upload_kwargs["content_type"] = content_type
@@ -1430,7 +1614,7 @@ class XmppAdapter(BasePlatformAdapter):
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
             sfs = self.client["xep_0447"].get_sfs(
-                path=Path(path),
+                path=Path(audio_path),
                 uris=[url],
                 media_type=content_type or "audio/ogg",
                 desc="Voice message",
@@ -1498,24 +1682,22 @@ async def send_xmpp_message(
 ) -> Dict[str, Any]:
     """One-shot send used by cron jobs and the send_message tool."""
     adapter = XmppAdapter(pconfig)
+    # Ephemeral resource on the account — must not consult or release the
+    # gateway adapter's per-JID scoped lock (compare IRC's "-cron" nick).
+    adapter._ephemeral_sender = True
     if not check_xmpp_requirements():
         return {"success": False, "error": "slixmpp not installed"}
     try:
         ok = await adapter.connect()
         if not ok:
-            return {"success": False, "error": adapter.fatal_error_message() or "connect failed"}
-        if adapter._session_ready is not None:
-            try:
-                await asyncio.wait_for(adapter._session_ready.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("xmpp: session_start did not fire within 10s; sending anyway")
+            return {"success": False, "error": adapter.fatal_error_message or "connect failed"}
         last_result = None
         if message:
             last_result = await adapter.send(chat_id=chat_id, content=message)
             if not last_result.success:
                 return {"success": False, "error": last_result.error}
         for media_path in media_files or []:
-            last_result = await adapter.send_document(chat_id=chat_id, path=media_path)
+            last_result = await adapter.send_document(chat_id=chat_id, file_path=media_path)
             if not last_result.success:
                 return {"success": False, "error": last_result.error}
         return {
@@ -1553,6 +1735,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
     for env, key in (
         ("XMPP_HOST", "host"),
         ("XMPP_PORT", "port"),
+        ("XMPP_DIRECT_TLS", "direct_tls"),
         ("XMPP_MUC_ROOMS", "muc_rooms"),
         ("XMPP_MUC_NICK", "muc_nick"),
         ("XMPP_ALLOWED_USERS", "allowed_users"),
@@ -1568,7 +1751,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     raw = dict(xmpp_cfg or {})
     extra = dict(raw.get("extra") or {})
     for key in (
-        "jid", "password", "host", "port", "muc_rooms", "muc_nick",
+        "jid", "password", "host", "port", "direct_tls", "muc_rooms", "muc_nick",
         "allowed_users", "allow_all_users", "max_message_length",
     ):
         if key in raw and key not in extra:
@@ -1592,6 +1775,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         "password": "XMPP_PASSWORD",
         "host": "XMPP_HOST",
         "port": "XMPP_PORT",
+        "direct_tls": "XMPP_DIRECT_TLS",
         "muc_rooms": "XMPP_MUC_ROOMS",
         "muc_nick": "XMPP_MUC_NICK",
         "allowed_users": "XMPP_ALLOWED_USERS",
@@ -1630,7 +1814,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["XMPP_JID", "XMPP_PASSWORD"],
-        install_hint="Install dependencies with: uv pip install slixmpp==1.15.0 aiohttp==3.13.4",
+        install_hint="Install dependencies with: uv pip install slixmpp==1.15.0 aiohttp==3.14.1",
         env_enablement_fn=_env_enablement,
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="XMPP_HOME_CHANNEL",

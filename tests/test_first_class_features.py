@@ -391,7 +391,7 @@ async def test_send_voice_uses_xep0447(fake_adapter, fake_client):
          patch("os.path.getsize", return_value=42):
         result = await fake_adapter.send_voice(
             chat_id="user@example.org",
-            path="/tmp/voice.ogg",
+            audio_path="/tmp/voice.ogg",
         )
     assert result.success is True
     xep0447.get_sfs.assert_called_once()
@@ -416,7 +416,7 @@ async def test_send_voice_falls_back_to_upload(fake_adapter, fake_client):
          patch("os.path.getsize", return_value=42):
         result = await fake_adapter.send_voice(
             chat_id="user@example.org",
-            path="/tmp/voice.ogg",
+            audio_path="/tmp/voice.ogg",
         )
     # Falls back to _upload_and_send which calls send_message
     fake_client.send_message.assert_called()
