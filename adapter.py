@@ -365,20 +365,35 @@ class XmppAdapter(BasePlatformAdapter):
     # before send() ever sees it.
     splits_long_messages = True
 
-    # How long connect() waits for the session to establish before declaring a
-    # retryable failure. Keep under the gateway's own per-platform connect
-    # timeout (HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, default 30s) so our
-    # diagnosis (bad host, rejected login) wins over a generic gateway-level
-    # timeout/cancellation. 25s (not 30s) leaves headroom for our own
-    # disconnect()/cleanup to run before the outer wait_for fires.
+    # How long the background _connect_watchdog() waits for the session to
+    # establish (auth + resource bind — signaled the instant _on_session_start
+    # fires, before any of its own post-connect housekeeping) before declaring
+    # a retryable failure and tearing the connection down.
     #
-    # 20s turned out too tight in the wild: TLS/SASL negotiation to a real
-    # server can legitimately take longer than that (slow network, IPv6
-    # attempted-then-abandoned, etc.), which surfaced as spurious
-    # xmpp_connect_timeout failures on a connection that would have
-    # succeeded a few seconds later. Overridable via XMPP_CONNECT_TIMEOUT_SECS
-    # / the connect_timeout_secs config key for slower links.
-    _CONNECT_TIMEOUT_SECS = 25.0
+    # This does NOT block connect()'s return — connect() kicks off the
+    # handshake and reports success immediately, then this watchdog runs
+    # independently. Two things that don't work here and why:
+    #
+    # - Blocking connect() on this wait: the gateway connects platforms one
+    #   at a time at startup, so blocking here stalls every other platform
+    #   behind XMPP for however long the wait takes.
+    # - Any fixed value under the gateway's own per-platform connect timeout
+    #   (gateway/run.py wraps connect() in its own asyncio.wait_for): if this
+    #   value were ever raised past that outer timeout, the outer one wins
+    #   the race and cancels connect() at whatever await point it's
+    #   suspended on. A previous version of this code awaited the session
+    #   directly inside connect() and only caught asyncio.TimeoutError there
+    #   — the outer timeout's CancelledError skipped that entirely, leaking
+    #   the client/task/lock while the handshake kept running unsupervised
+    #   in the background (and eventually succeeding, well after the gateway
+    #   had already logged the connect as failed and moved on).
+    #
+    # Running this as a decoupled background task sidesteps both problems.
+    # 90s gives comfortable margin over a real-world report of "no client on
+    # this network takes more than 60s to connect." Overridable via
+    # XMPP_CONNECT_TIMEOUT_SECS / the connect_timeout_secs config key for
+    # servers slower still.
+    _CONNECT_TIMEOUT_SECS = 90.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
@@ -474,6 +489,7 @@ class XmppAdapter(BasePlatformAdapter):
         # Lazy state
         self.client: Optional[Any] = None
         self._process_task: Optional[asyncio.Task] = None
+        self._connect_watchdog_task: Optional[asyncio.Task] = None
         self._session_ready: Optional[asyncio.Event] = None
         self._session_established = False
         # Set while disconnect() is tearing the client down on purpose, so
@@ -626,29 +642,27 @@ class XmppAdapter(BasePlatformAdapter):
 
         # ``connect()`` only kicks off the TCP/TLS/SASL handshake (slixmpp
         # returns a Future, never a bool — there is no synchronous failure to
-        # check here). Wait, bounded, for the session to actually establish
-        # before reporting success. Otherwise an unreachable server, a wrong
-        # host, or a rejected login would leave the gateway believing XMPP is
-        # connected over a dead socket with nothing driving recovery (#28919).
-        try:
-            await asyncio.wait_for(
-                self._session_ready.wait(), timeout=self._CONNECT_TIMEOUT_SECS
-            )
-        except asyncio.TimeoutError:
-            if not self.has_fatal_error:
-                self._set_fatal_error(
-                    "xmpp_connect_timeout",
-                    f"XMPP session did not establish within "
-                    f"{self._CONNECT_TIMEOUT_SECS:g}s — check XMPP_HOST/XMPP_PORT "
-                    "and server reachability",
-                    retryable=True,
-                )
-            await self.disconnect()
-            return False
-        if self.has_fatal_error:
-            # e.g. failed_all_auth fired (bad credentials) while we waited.
-            await self.disconnect()
-            return False
+        # check here) and returns immediately, matching the pre-existing
+        # behavior. It deliberately does NOT block waiting for the session to
+        # establish: the gateway connects platforms one at a time during
+        # startup, and a real server's TLS/SASL negotiation can legitimately
+        # take much longer than any fixed bound comfortably fits into a
+        # sequential startup (observed in production: 60-90s+) — blocking
+        # here would stall every other platform behind XMPP. It also can't
+        # be raced against the gateway's own per-platform connect timeout
+        # (gateway/run.py wraps connect() in its own asyncio.wait_for): if
+        # that outer timeout ever won the race against a long internal wait
+        # here, it would inject CancelledError at our await point, skip our
+        # cleanup, and leak the client/task/lock while the handshake kept
+        # running unsupervised in the background.
+        #
+        # Instead, a background watchdog independently waits up to
+        # _CONNECT_TIMEOUT_SECS for the session and, if it never establishes,
+        # escalates via the same fatal-error + notify path used for a live
+        # connection dropping (#28919) — so the reconnect watcher still gets
+        # a chance to recover a truly-dead connection, without connect()
+        # itself ever blocking on it.
+        self._connect_watchdog_task = loop.create_task(self._connect_watchdog())
 
         if omemo_ok:
             logger.info("XMPP adapter: OMEMO enabled (storage: %s)", self._omemo_storage_path)
@@ -660,6 +674,26 @@ class XmppAdapter(BasePlatformAdapter):
         self._mark_connected()
         return True
 
+    async def _connect_watchdog(self) -> None:
+        try:
+            await asyncio.wait_for(
+                self._session_ready.wait(), timeout=self._CONNECT_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            if self._closing or self.has_fatal_error:
+                return
+            self._set_fatal_error(
+                "xmpp_connect_timeout",
+                f"XMPP session did not establish within "
+                f"{self._CONNECT_TIMEOUT_SECS:g}s — check XMPP_HOST/XMPP_PORT "
+                "and server reachability",
+                retryable=True,
+            )
+            await self.disconnect()
+            await self._notify_fatal_error()
+        except asyncio.CancelledError:
+            pass
+
     async def disconnect(self) -> None:
         self._closing = True
         if self.client is not None:
@@ -670,6 +704,10 @@ class XmppAdapter(BasePlatformAdapter):
         if self._process_task is not None:
             self._process_task.cancel()
             self._process_task = None
+        current_task = asyncio.current_task()
+        if self._connect_watchdog_task is not None and self._connect_watchdog_task is not current_task:
+            self._connect_watchdog_task.cancel()
+            self._connect_watchdog_task = None
         self.client = None
         self._release_platform_lock()
         self._mark_disconnected()
@@ -697,6 +735,20 @@ class XmppAdapter(BasePlatformAdapter):
             return
         self._session_established = True
         self.client.send_presence()  # type: ignore[union-attr]
+        # Signal readiness NOW, before any of the housekeeping below. This
+        # event firing at all means the stream is authenticated and
+        # resource-bound — that's the actual definition of "connected" that
+        # _connect_watchdog / send_xmpp_message care about. get_roster(),
+        # MUC joins, and the presence-subscribe loop are best-effort
+        # post-connect housekeeping: any one of them being slow or hanging
+        # on a particular server must not delay (or, against a server that
+        # never answers a given IQ, indefinitely block) the readiness
+        # signal. A slow get_roster() IQ round-trip was observed in
+        # production stalling this exact signal for 80+ seconds after the
+        # SASL/bind handshake — and therefore OMEMO init — had already
+        # completed successfully.
+        if self._session_ready is not None:
+            self._session_ready.set()
         try:
             await self.client.get_roster()  # type: ignore[union-attr]
         except Exception:
@@ -716,8 +768,6 @@ class XmppAdapter(BasePlatformAdapter):
                 self.client.send_presence(pto=jid, ptype="subscribe")  # type: ignore[union-attr]
             except Exception:
                 logger.debug("xmpp: subscribe request to %s failed", jid, exc_info=True)
-        if self._session_ready is not None:
-            self._session_ready.set()
         # Register ad-hoc commands now that session is active
         try:
             await self._setup_adhoc_commands()
@@ -1716,6 +1766,25 @@ async def send_xmpp_message(
         ok = await adapter.connect()
         if not ok:
             return {"success": False, "error": adapter.fatal_error_message or "connect failed"}
+        # connect() now returns as soon as the handshake is kicked off (see
+        # _connect_watchdog's docstring for why it no longer blocks on
+        # session establishment) — the stream isn't necessarily authenticated
+        # yet. Unlike the gateway's long-running adapter, this one-shot
+        # sender has nothing else useful to do meanwhile, so it explicitly
+        # waits for the session here before attempting to send.
+        if adapter._session_ready is not None:
+            try:
+                await asyncio.wait_for(
+                    adapter._session_ready.wait(), timeout=adapter._CONNECT_TIMEOUT_SECS
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "success": False,
+                    "error": (
+                        f"XMPP session did not establish within "
+                        f"{adapter._CONNECT_TIMEOUT_SECS:g}s"
+                    ),
+                }
         last_result = None
         if message:
             last_result = await adapter.send(chat_id=chat_id, content=message)

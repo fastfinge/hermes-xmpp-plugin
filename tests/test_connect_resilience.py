@@ -1,8 +1,16 @@
-"""Tests for connect()/disconnect() resilience fixes ported from upstream PR #17469:
+"""Tests for connect()/disconnect() resilience fixes ported from upstream PR #17469,
+plus the follow-up redesign after a production incident:
 
 - scoped per-JID account lock (acquire on connect, release on disconnect)
-- bounded wait for session establishment, with a fatal timeout instead of a
-  premature "connected" report
+- connect() returns as soon as the handshake is kicked off — it does NOT block
+  on session establishment. A background _connect_watchdog() independently
+  waits up to _CONNECT_TIMEOUT_SECS and escalates to a fatal error + notify if
+  the session never comes up. (An earlier version blocked connect() itself on
+  this wait; in production, that raced against the gateway's own per-platform
+  connect timeout, which could cancel connect() mid-wait and leak the
+  client/task/lock while the handshake kept running unsupervised in the
+  background. Blocking also stalled every other platform's startup behind a
+  slow-but-legitimate XMPP handshake.)
 - host/port are honored on both the primary and fallback connect() signatures
 - TLS enforcement knobs (enable_starttls / enable_direct_tls / enable_plaintext)
   and XMPP_DIRECT_TLS / direct_tls config
@@ -257,6 +265,28 @@ def _reset_state():
 
 
 # -----------------------------------------------------------------
+# connect() returns immediately — it does not block on session establishment
+# -----------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_connect_returns_true_immediately_without_session_start(monkeypatch):
+    """connect() must NOT wait for the session to establish. This is the
+    core of the redesign: blocking here stalled every other platform behind
+    a slow XMPP handshake, and raced against the gateway's own outer
+    connect timeout (see module docstring)."""
+    a = adapter.XmppAdapter(_make_cfg())
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await asyncio.wait_for(a.connect(), timeout=1.0)  # would hang/timeout if connect() blocked
+    assert ok is True
+    assert a._session_ready.is_set() is False  # session hasn't actually started yet
+
+    await a.client.fire("session_start")
+    await a._connect_watchdog_task  # let the watchdog observe success and exit
+    await a.disconnect()
+
+
+# -----------------------------------------------------------------
 # Scoped per-JID lock
 # -----------------------------------------------------------------
 
@@ -264,17 +294,11 @@ def _reset_state():
 async def test_connect_acquires_lock_on_normalized_bare_jid(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg(jid="Hermes@Example.ORG/ignored-resource"))
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("session_start")
-
-    task = asyncio.create_task(_drive())
     ok = await a.connect()
-    await task
     assert ok is True
     assert acquire_calls == [("xmpp", "hermes@example.org", "XMPP account hermes@example.org")]
+    await a.disconnect()
 
 
 @pytest.mark.asyncio
@@ -294,15 +318,8 @@ async def test_connect_fails_and_returns_false_when_lock_held(monkeypatch):
 async def test_disconnect_releases_lock(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg())
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("session_start")
-
-    task = asyncio.create_task(_drive())
     ok = await a.connect()
-    await task
     assert ok is True
 
     await a.disconnect()
@@ -343,20 +360,106 @@ async def test_standalone_sender_skips_lock(monkeypatch):
 
 
 # -----------------------------------------------------------------
-# Bounded session-establishment wait
+# send_xmpp_message: since connect() no longer blocks on session
+# establishment, the one-shot sender must wait for it explicitly before
+# calling send() — otherwise it would try to send over an unauthenticated
+# stream.
 # -----------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_connect_times_out_when_session_never_starts(monkeypatch):
-    a = adapter.XmppAdapter(_make_cfg())
+async def test_standalone_sender_waits_for_session_before_sending(monkeypatch):
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.05
+    cfg = _make_cfg()
+
+    send_calls = []
+
+    async def _fake_send(self, *a, **kw):
+        send_calls.append((a, kw))
+        return adapter.SendResult(success=True, message_id="m1")
+
+    monkeypatch.setattr(adapter.XmppAdapter, "send", _fake_send)
+
+    a_holder = {}
+    orig_init = adapter.XmppAdapter.__init__
+
+    def _capture_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        a_holder["a"] = self
+
+    monkeypatch.setattr(adapter.XmppAdapter, "__init__", _capture_init)
+
+    async def _drive():
+        while "a" not in a_holder or a_holder["a"].client is None:
+            await asyncio.sleep(0.005)
+        # send() must not have been called yet — session hasn't started.
+        assert send_calls == []
+        await a_holder["a"].client.fire("session_start")
+
+    driver = asyncio.create_task(_drive())
+    result = await adapter.send_xmpp_message(cfg, "user@example.org", "hi")
+    await driver
+
+    assert result["success"] is True
+    assert len(send_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_sender_times_out_if_session_never_starts(monkeypatch):
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+    cfg = _make_cfg(connect_timeout_secs="0.05")
+
+    result = await adapter.send_xmpp_message(cfg, "user@example.org", "hi")
+    assert result["success"] is False
+    assert "did not establish" in result["error"]
+
+
+# -----------------------------------------------------------------
+# Background connect watchdog: timeout escalation without blocking connect()
+# -----------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_watchdog_escalates_and_notifies_when_session_never_starts(monkeypatch):
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.05"))
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
 
     ok = await a.connect()
-    assert ok is False
+    assert ok is True  # connect() itself always reports success immediately
+
+    await a._connect_watchdog_task  # wait for the watchdog to time out and act
     assert a.fatal_error_code == "xmpp_connect_timeout"
-    assert a.client is None  # disconnect() clears it
-    assert release_calls == ["hermes@example.org"]  # failed connect still releases the lock
+    assert a.fatal_error_retryable is True
+    assert a.client is None  # the watchdog tore the connection down
+    assert notify_calls == [a]
+    assert release_calls == ["hermes@example.org"]  # lock released via disconnect()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_fire_after_deliberate_disconnect(monkeypatch):
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.05"))
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await a.connect()
+    assert ok is True
+    await a.disconnect()  # cancels the still-pending watchdog task
+
+    await asyncio.sleep(0.1)  # past the watchdog's timeout, if it were still running
+    assert notify_calls == []
+    assert a.has_fatal_error is False
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_override_an_existing_fatal_error(monkeypatch):
+    """If failed_all_auth already set a fatal error before the watchdog's
+    wait expires, the watchdog must not clobber it with a generic timeout."""
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.05"))
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await a.connect()
+    assert ok is True
+    await a.client.fire("failed_all_auth")
+
+    await a._connect_watchdog_task
+    assert a.fatal_error_code == "xmpp_auth_failed"
 
 
 @pytest.mark.asyncio
@@ -369,21 +472,32 @@ async def test_failed_all_auth_sets_nonretryable_fatal_and_notifies():
 
 
 @pytest.mark.asyncio
-async def test_connect_returns_false_when_auth_fails_during_wait(monkeypatch):
+async def test_session_ready_set_before_slow_get_roster():
+    """Regression: a production connection stalled 'connected' for 80+
+    seconds after auth/bind (and OMEMO init, on its own independent event
+    chain) had already succeeded — because _session_ready.set() used to sit
+    AFTER the get_roster() IQ round-trip, and get_roster() was slow/hanging
+    on that server. _session_ready must fire the instant _on_session_start
+    runs, before any of that best-effort housekeeping, so a hanging IQ can
+    never block readiness."""
     a = adapter.XmppAdapter(_make_cfg())
-    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
+    a._session_ready = asyncio.Event()
+    never_set = asyncio.Event()  # get_roster() awaits this and it never fires
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("failed_all_auth")
+    client = MagicMock()
+    client.send_presence = MagicMock()
+    client.get_roster = lambda: never_set.wait()
+    a.client = client
 
-    task = asyncio.create_task(_drive())
-    ok = await a.connect()
-    await task
-    assert ok is False
-    assert a.fatal_error_code == "xmpp_auth_failed"
-    assert a.fatal_error_retryable is False
+    task = asyncio.create_task(a._on_session_start(None))
+    await asyncio.sleep(0.05)  # let it reach (and hang inside) get_roster()
+    assert a._session_ready.is_set() is True
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 # -----------------------------------------------------------------
@@ -394,17 +508,11 @@ async def test_connect_returns_false_when_auth_fails_during_wait(monkeypatch):
 async def test_connect_passes_host_and_port(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg(host="xmpp.example.net", port=5269))
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("session_start")
-
-    task = asyncio.create_task(_drive())
     ok = await a.connect()
-    await task
     assert ok is True
     assert a.client.connect_calls == [((), {"host": "xmpp.example.net", "port": 5269})]
+    await a.disconnect()
 
 
 # -----------------------------------------------------------------
@@ -415,18 +523,12 @@ async def test_connect_passes_host_and_port(monkeypatch):
 async def test_connect_sets_tls_enforcement_knobs(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg())
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("session_start")
-
-    task = asyncio.create_task(_drive())
     await a.connect()
-    await task
     assert a.client.enable_starttls is True
     assert a.client.enable_plaintext is False
     assert a.client.enable_direct_tls is False  # port 5222 default
+    await a.disconnect()
 
 
 def test_direct_tls_defaults_off_on_standard_port():
@@ -457,15 +559,9 @@ def test_direct_tls_extra_key_forces_off_beats_port():
 async def test_deliberate_disconnect_does_not_escalate(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg())
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("session_start")
-
-    task = asyncio.create_task(_drive())
     await a.connect()
-    await task
+    await a.client.fire("session_start")
 
     await a.disconnect()
     assert a.has_fatal_error is False
@@ -476,15 +572,10 @@ async def test_deliberate_disconnect_does_not_escalate(monkeypatch):
 async def test_unexpected_disconnect_escalates_and_notifies(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg())
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
-    a._CONNECT_TIMEOUT_SECS = 0.2
 
-    async def _drive():
-        await asyncio.sleep(0.01)
-        await a.client.fire("session_start")
-
-    task = asyncio.create_task(_drive())
     await a.connect()
-    await task
+    await a.client.fire("session_start")
+    await a._connect_watchdog_task  # let it settle on success first
 
     # Server drops the connection out of the blue (no disconnect() call).
     await a._on_disconnected(None)
@@ -534,14 +625,12 @@ def test_splits_long_messages_declared():
 
 
 # -----------------------------------------------------------------
-# Connect-session-establish timeout: 20s proved too tight against a real
-# server in production (TLS/SASL negotiation exceeded it on a working
-# connection) — default bumped to 25s and made operator-configurable.
+# Connect-watchdog timeout: configurable, generous default
 # -----------------------------------------------------------------
 
-def test_connect_timeout_default_is_25s():
+def test_connect_timeout_default_is_90s():
     a = adapter.XmppAdapter(_make_cfg())
-    assert a._CONNECT_TIMEOUT_SECS == 25.0
+    assert a._CONNECT_TIMEOUT_SECS == 90.0
 
 
 def test_connect_timeout_overridable_via_extra_key():
@@ -557,22 +646,28 @@ def test_connect_timeout_overridable_via_env_var(monkeypatch):
 
 def test_connect_timeout_invalid_value_falls_back_to_default(monkeypatch):
     a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="not-a-number"))
-    assert a._CONNECT_TIMEOUT_SECS == 25.0
+    assert a._CONNECT_TIMEOUT_SECS == 90.0
 
 
 @pytest.mark.asyncio
-async def test_connect_uses_instance_level_timeout_override(monkeypatch):
-    """connect() must await self._CONNECT_TIMEOUT_SECS (the per-instance
+async def test_connect_watchdog_uses_instance_level_timeout_override(monkeypatch):
+    """The watchdog must await self._CONNECT_TIMEOUT_SECS (the per-instance
     value), not the class-level default — this is what lets an operator on a
-    slow link raise the limit via XMPP_CONNECT_TIMEOUT_SECS / config."""
+    slow link raise the limit via XMPP_CONNECT_TIMEOUT_SECS / config, without
+    connect() itself ever blocking on it."""
     a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.3"))
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await a.connect()
+    assert ok is True
 
     async def _drive():
         await asyncio.sleep(0.15)
         await a.client.fire("session_start")
 
     task = asyncio.create_task(_drive())
-    ok = await a.connect()
+    await a._connect_watchdog_task
     await task
-    assert ok is True
+    # The watchdog observed success within its 0.3s window rather than
+    # timing out at the (much larger) class default.
+    assert a.has_fatal_error is False

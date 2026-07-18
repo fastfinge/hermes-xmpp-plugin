@@ -31,7 +31,7 @@ optional_env:
     prompt: Force direct TLS? true/false
     password: false
   - name: XMPP_CONNECT_TIMEOUT_SECS
-    description: How long connect() waits for the session to establish before giving up (default 25 seconds). Raise this on a slow/high-latency link to the server.
+    description: How long the background connect watchdog waits for the session to establish before giving up (default 90 seconds); does not block gateway startup. Raise this on a slow/high-latency link to the server.
     prompt: Connect timeout in seconds
     password: false
   - name: XMPP_ALLOWED_USERS

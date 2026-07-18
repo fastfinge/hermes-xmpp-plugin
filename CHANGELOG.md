@@ -28,9 +28,16 @@ All notable changes to this project will be documented in this file.
 - `splits_long_messages = True` is now declared on the adapter so a host
   gateway that checks it can skip pre-truncating cron/delivery output before
   `send()` ever sees it.
-- **Configurable connect timeout**: the session-establish wait added below is
-  tunable via `XMPP_CONNECT_TIMEOUT_SECS` / the `connect_timeout_secs` config
-  key, for operators on a slow or high-latency link to their server.
+- **Background connect watchdog**: `connect()` kicks off the handshake and
+  reports success immediately (it does not block on session establishment —
+  the gateway connects platforms one at a time at startup, and blocking here
+  would stall every other platform behind a slow XMPP handshake). A
+  background `_connect_watchdog()` task independently waits up to
+  `_CONNECT_TIMEOUT_SECS` (default 90s; tunable via `XMPP_CONNECT_TIMEOUT_SECS`
+  / the `connect_timeout_secs` config key) and, if the session never
+  establishes, tears the connection down and notifies the gateway so its
+  reconnect watcher retries — the same escalation path used for a live
+  connection dropping (#28919).
 
 ### Fixed
 
@@ -40,17 +47,26 @@ All notable changes to this project will be documented in this file.
   `_truthy()` helper everywhere instead of `bool(str)`. Plain `bool("False")`
   is `True` for any non-empty string, so setting `XMPP_OMEMO_ENABLED=False` in
   `.env` was silently ignored and OMEMO stayed on.
-- **Connect-timeout default raised 20s → 25s** after a real deploy showed the
-  20s wait was too tight: TLS/SASL negotiation to a real server legitimately
-  took longer than that, so a connection that would have succeeded a few
-  seconds later was misdiagnosed as `xmpp_connect_timeout` and dropped into
-  the retry/backoff cycle instead. Now configurable per the above, since a
-  fixed constant can't fit every network.
-- `connect()` now waits (bounded, 25s by default) for the XMPP session to
-  actually establish before reporting success, and sets a retryable fatal
-  error on timeout. Previously it reported "connected" as soon as
-  `client.connect()` returned a Future, so an unreachable server, wrong host,
-  or rejected login left the gateway believing XMPP was up over a dead socket.
+- **`_session_ready` fires the instant the session starts**, before
+  `get_roster()`, MUC joins, or the presence-subscribe loop — not after. A
+  production connection was observed staying "not yet connected" for 80+
+  seconds after auth/bind (and OMEMO init, on its own independent event
+  chain) had already succeeded, because a slow/hanging `get_roster()` IQ
+  round-trip on that particular server sat *before* the readiness signal.
+  None of that housekeeping is required for the session to be usable, so it
+  no longer gates it.
+- Previously, an earlier revision of this fix made `connect()` block
+  (bounded) on session establishment before reporting success — a real
+  deploy showed this was the wrong design entirely, for two reasons: (1) it
+  stalled every other platform's startup behind a slow-but-working XMPP
+  handshake, and (2) any timeout value here could race the gateway's own
+  per-platform connect timeout (`gateway/run.py` wraps `connect()` in its own
+  `asyncio.wait_for`) — if that outer timeout won, it injected
+  `CancelledError` at the await point inside `connect()`, which only caught
+  `asyncio.TimeoutError` there, skipping cleanup entirely and leaking the
+  client/task/lock while the handshake kept running unsupervised in the
+  background. Replaced with the background-watchdog design above, which
+  can't race the outer timeout and never blocks the gateway's startup.
 - `connect()` no longer silently drops `XMPP_HOST`/`XMPP_PORT` on a fallback
   path. The old code called `client.connect(address=(host, port))`, which
   isn't a valid slixmpp kwarg — it always raised `TypeError` and fell through
