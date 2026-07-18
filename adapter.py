@@ -366,7 +366,7 @@ class XmppAdapter(BasePlatformAdapter):
     splits_long_messages = True
 
     # How long the background _connect_watchdog() waits for the session to
-    # establish (auth + resource bind — signaled the instant _on_session_start
+    # establish (auth + resource bind — signaled the instant _on_session_bind
     # fires, before any of its own post-connect housekeeping) before declaring
     # a retryable failure and tearing the connection down.
     #
@@ -593,7 +593,22 @@ class XmppAdapter(BasePlatformAdapter):
         client.enable_direct_tls = self.direct_tls  # type: ignore[attr-defined,reportAttributeAccessIssue]
         client.enable_plaintext = False  # type: ignore[attr-defined,reportAttributeAccessIssue]
 
-        client.add_event_handler("session_start", self._on_session_start)
+        # "session_bind" (fired immediately once resource binding succeeds —
+        # see slixmpp/features/feature_bind/bind.py) rather than
+        # "session_start". session_start additionally depends on the legacy,
+        # OPTIONAL RFC 3921 IQ-based session-establishment round-trip
+        # completing (slixmpp/features/feature_session/session.py) — several
+        # real servers advertise that feature but never reliably respond to
+        # the IQ, in which case session_start NEVER fires even though
+        # authentication and resource binding fully succeeded. Observed in
+        # production: bind completed and OMEMO initialized successfully, yet
+        # session_start never fired, so send_presence() (previously here)
+        # never ran — the bot never appeared online and _session_ready never
+        # fired, even though the connection was otherwise fully usable.
+        # session_bind is what slixmpp_omemo and dozens of built-in slixmpp
+        # plugins (xep_0030, xep_0045, xep_0199, ...) key their own
+        # post-connect setup off for exactly this reason.
+        client.add_event_handler("session_bind", self._on_session_bind)
         # slixmpp dispatches MUC stanzas to BOTH "message" and
         # "groupchat_message", so registering _on_message for both would run it
         # twice for every group-chat message. Register "message" only — it
@@ -730,7 +745,7 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("xmpp: process loop crashed")
 
-    async def _on_session_start(self, _event: Any) -> None:
+    async def _on_session_bind(self, _jid: Any) -> None:
         if self.client is None:
             return
         self._session_established = True

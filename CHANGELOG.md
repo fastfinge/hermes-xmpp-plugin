@@ -47,14 +47,20 @@ All notable changes to this project will be documented in this file.
   `_truthy()` helper everywhere instead of `bool(str)`. Plain `bool("False")`
   is `True` for any non-empty string, so setting `XMPP_OMEMO_ENABLED=False` in
   `.env` was silently ignored and OMEMO stayed on.
-- **`_session_ready` fires the instant the session starts**, before
-  `get_roster()`, MUC joins, or the presence-subscribe loop — not after. A
-  production connection was observed staying "not yet connected" for 80+
-  seconds after auth/bind (and OMEMO init, on its own independent event
-  chain) had already succeeded, because a slow/hanging `get_roster()` IQ
-  round-trip on that particular server sat *before* the readiness signal.
-  None of that housekeeping is required for the session to be usable, so it
-  no longer gates it.
+- **Readiness (`_session_ready`, `send_presence()`, roster/MUC/subscribe
+  setup) now fires on slixmpp's `session_bind` event instead of
+  `session_start`.** `session_start` additionally depends on the legacy,
+  *optional* RFC 3921 IQ-based session-establishment round-trip
+  (`slixmpp/features/feature_session`) completing. A real server was
+  observed advertising that feature but never reliably responding to the
+  IQ — so `session_start` never fired at all, even though authentication and
+  resource binding had fully succeeded (confirmed by slixmpp's own "JID
+  set to" log line) and OMEMO had already initialized (it keys off the
+  separate, always-reliable `session_bind` event, which is also what dozens
+  of built-in slixmpp plugins use for their own post-connect setup).
+  Concretely, this meant `send_presence()` never ran, so the bot never
+  appeared online to contacts, and the watchdog eventually timed out and
+  cycled a connection that was otherwise perfectly usable.
 - Previously, an earlier revision of this fix made `connect()` block
   (bounded) on session establishment before reporting success — a real
   deploy showed this was the wrong design entirely, for two reasons: (1) it

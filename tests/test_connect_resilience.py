@@ -281,8 +281,39 @@ async def test_connect_returns_true_immediately_without_session_start(monkeypatc
     assert ok is True
     assert a._session_ready.is_set() is False  # session hasn't actually started yet
 
-    await a.client.fire("session_start")
+    await a.client.fire("session_bind")
     await a._connect_watchdog_task  # let the watchdog observe success and exit
+    await a.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_readiness_does_not_depend_on_session_start_ever_firing(monkeypatch):
+    """Regression: a production server advertised the legacy, OPTIONAL RFC
+    3921 IQ-based session-establishment feature but never reliably responded
+    to that IQ — so slixmpp's "session_start" event never fired, even though
+    authentication and resource binding (and OMEMO init, which keys off the
+    separate "session_bind" event) fully succeeded. The old code gated
+    readiness (and send_presence()) on "session_start", so the bot never
+    appeared online and the watchdog eventually timed the connection out
+    despite it being perfectly usable. Readiness must be driven by
+    "session_bind" alone — this test never fires "session_start" at all and
+    the watchdog must still observe success."""
+    a = adapter.XmppAdapter(_make_cfg(connect_timeout_secs="0.1"))
+    monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
+
+    ok = await a.connect()
+    assert ok is True
+
+    presence_calls = []
+    a.client.send_presence = lambda *a_, **k: presence_calls.append((a_, k))
+
+    await a.client.fire("session_bind")  # "session_start" is deliberately never fired
+    await a._connect_watchdog_task
+
+    assert a.has_fatal_error is False  # no spurious xmpp_connect_timeout
+    # The broadcast presence() (announcing the bot as online) took place —
+    # distinct from any per-peer subscribe-request presence calls.
+    assert any(args == () and kw == {} for args, kw in presence_calls)
     await a.disconnect()
 
 
@@ -348,7 +379,7 @@ async def test_standalone_sender_skips_lock(monkeypatch):
     async def _drive():
         while a is None or a.client is None:
             await asyncio.sleep(0.005)
-        await a.client.fire("session_start")
+        await a.client.fire("session_bind")
 
     driver = asyncio.create_task(_drive())
     result = await adapter.send_xmpp_message(cfg, "user@example.org", "hi")
@@ -393,7 +424,7 @@ async def test_standalone_sender_waits_for_session_before_sending(monkeypatch):
             await asyncio.sleep(0.005)
         # send() must not have been called yet — session hasn't started.
         assert send_calls == []
-        await a_holder["a"].client.fire("session_start")
+        await a_holder["a"].client.fire("session_bind")
 
     driver = asyncio.create_task(_drive())
     result = await adapter.send_xmpp_message(cfg, "user@example.org", "hi")
@@ -477,7 +508,7 @@ async def test_session_ready_set_before_slow_get_roster():
     seconds after auth/bind (and OMEMO init, on its own independent event
     chain) had already succeeded — because _session_ready.set() used to sit
     AFTER the get_roster() IQ round-trip, and get_roster() was slow/hanging
-    on that server. _session_ready must fire the instant _on_session_start
+    on that server. _session_ready must fire the instant _on_session_bind
     runs, before any of that best-effort housekeeping, so a hanging IQ can
     never block readiness."""
     a = adapter.XmppAdapter(_make_cfg())
@@ -489,7 +520,7 @@ async def test_session_ready_set_before_slow_get_roster():
     client.get_roster = lambda: never_set.wait()
     a.client = client
 
-    task = asyncio.create_task(a._on_session_start(None))
+    task = asyncio.create_task(a._on_session_bind(None))
     await asyncio.sleep(0.05)  # let it reach (and hang inside) get_roster()
     assert a._session_ready.is_set() is True
 
@@ -561,7 +592,7 @@ async def test_deliberate_disconnect_does_not_escalate(monkeypatch):
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
 
     await a.connect()
-    await a.client.fire("session_start")
+    await a.client.fire("session_bind")
 
     await a.disconnect()
     assert a.has_fatal_error is False
@@ -574,7 +605,7 @@ async def test_unexpected_disconnect_escalates_and_notifies(monkeypatch):
     monkeypatch.setattr(adapter, "ClientXMPP", _FakeSlixmppClient)
 
     await a.connect()
-    await a.client.fire("session_start")
+    await a.client.fire("session_bind")
     await a._connect_watchdog_task  # let it settle on success first
 
     # Server drops the connection out of the blue (no disconnect() call).
@@ -663,7 +694,7 @@ async def test_connect_watchdog_uses_instance_level_timeout_override(monkeypatch
 
     async def _drive():
         await asyncio.sleep(0.15)
-        await a.client.fire("session_start")
+        await a.client.fire("session_bind")
 
     task = asyncio.create_task(_drive())
     await a._connect_watchdog_task
