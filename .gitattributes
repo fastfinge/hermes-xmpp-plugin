@@ -1,0 +1,19 @@
+# Cross-platform line-ending policy: store LF in the repo, always.
+# Editing on Windows (core.autocrlf=true or an editor that saves CRLF)
+# will no longer dirty the tree — git normalizes to LF on commit.
+#
+# Default: treat everything as text, normalize to LF on checkin.
+* text=auto eol=lf
+
+# Explicit overrides for files that must keep exact bytes.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.ogg  binary
+*.mp3  binary
+*.wav  binary
+*.opus binary
