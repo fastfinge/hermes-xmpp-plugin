@@ -54,6 +54,7 @@ except ImportError:
 
 
 import asyncio
+import inspect
 import json
 import logging
 import mimetypes
@@ -406,6 +407,11 @@ class XmppAdapter(BasePlatformAdapter):
     # is fixed (which would also make connects noticeably faster).
     _CONNECT_TIMEOUT_SECS = 180.0
 
+    # How long disconnect() waits for slixmpp to flush the send queue before
+    # giving up — bounded so an unresponsive server can't hang an unattended
+    # cron job on teardown.
+    _DISCONNECT_TIMEOUT_SECS = 10.0
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
         extra = config.extra or {}
@@ -743,7 +749,23 @@ class XmppAdapter(BasePlatformAdapter):
             # worse, so plain disconnect() without forced cancellation is the
             # safer default here.
             try:
-                self.client.disconnect()
+                # slixmpp's disconnect() returns a Future that drains the
+                # send queue before closing the stream — it must be awaited.
+                # The gateway's long-lived loop would eventually run it, but
+                # send_xmpp_message()'s caller closes its loop as soon as we
+                # return, silently dropping any still-queued stanza (send
+                # only enqueues, so success was already reported). Guarded
+                # with isawaitable since older slixmpp returned None here.
+                pending = self.client.disconnect()
+                if inspect.isawaitable(pending):
+                    await asyncio.wait_for(
+                        pending, timeout=self._DISCONNECT_TIMEOUT_SECS
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "xmpp: send-queue flush did not complete within %gs",
+                    self._DISCONNECT_TIMEOUT_SECS,
+                )
             except Exception:
                 logger.exception("xmpp: error during disconnect()")
         if self._process_task is not None:

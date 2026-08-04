@@ -73,6 +73,7 @@ gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
     "handle_message": lambda *a, **kw: None,
     "build_source": lambda s, **kw: MagicMock(**kw),
     "_mark_disconnected": lambda s: None,
+    "_release_platform_lock": lambda s: None,
     "fatal_error_message": lambda s, *a, **kw: "auth failed",
 })
 
@@ -208,6 +209,36 @@ class TestLifecycle:
 
     def test_disconnect_method_exists(self, adapter_instance):
         assert callable(getattr(adapter_instance, "disconnect", None))
+
+    @pytest.mark.asyncio
+    async def test_disconnect_awaits_send_queue_flush(self, adapter_instance):
+        """slixmpp's disconnect() returns a Future that drains the send queue
+        before closing the stream. It must be awaited, otherwise one-shot
+        sends (e.g. cron alerts) silently drop the queued stanza."""
+        drained = False
+
+        async def _drain():
+            nonlocal drained
+            drained = True
+
+        client = MagicMock()
+        client.disconnect = lambda *a, **kw: _drain()
+        adapter_instance.client = client
+
+        await adapter_instance.disconnect()
+        assert drained is True
+
+    @pytest.mark.asyncio
+    async def test_disconnect_flush_timeout_is_bounded(self, adapter_instance):
+        """An unresponsive server must not hang teardown — the flush wait is
+        bounded, and cleanup still runs."""
+        adapter_instance._DISCONNECT_TIMEOUT_SECS = 0.05
+        client = MagicMock()
+        client.disconnect = lambda *a, **kw: asyncio.Event().wait()  # never completes
+        adapter_instance.client = client
+
+        await asyncio.wait_for(adapter_instance.disconnect(), timeout=1.0)
+        assert adapter_instance.client is None
 
 
 # -----------------------------------------------------------------
