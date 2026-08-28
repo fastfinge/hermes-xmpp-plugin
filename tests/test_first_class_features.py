@@ -391,7 +391,7 @@ async def test_send_voice_uses_xep0447(fake_adapter, fake_client):
          patch("os.path.getsize", return_value=42):
         result = await fake_adapter.send_voice(
             chat_id="user@example.org",
-            path="/tmp/voice.ogg",
+            audio_path="/tmp/voice.ogg",
         )
     assert result.success is True
     xep0447.get_sfs.assert_called_once()
@@ -416,7 +416,7 @@ async def test_send_voice_falls_back_to_upload(fake_adapter, fake_client):
          patch("os.path.getsize", return_value=42):
         result = await fake_adapter.send_voice(
             chat_id="user@example.org",
-            path="/tmp/voice.ogg",
+            audio_path="/tmp/voice.ogg",
         )
     # Falls back to _upload_and_send which calls send_message
     fake_client.send_message.assert_called()
@@ -457,6 +457,7 @@ async def test_on_message_extracts_reply_context(fake_adapter, fake_client):
 # ------------------------------------------------------------------
 # B4 — Clarify form body includes numbered fallback (issue #8)
 # ------------------------------------------------------------------
+# (merged with origin/main: MUC self-reply tests follow below)
 
 @pytest.mark.asyncio
 async def test_send_clarify_form_body_includes_numbered_choices(fake_adapter, fake_client):
@@ -627,3 +628,100 @@ async def test_on_message_form_submission_no_body_no_crash(fake_adapter, fake_cl
     # Should not crash, should not emit an event (empty form with no clarify_id)
     await fake_adapter._on_message(stanza)
     assert len(events) == 0
+
+
+# ------------------------------------------------------------------
+# Issue #6 — MUC self-reply loop + duplicate handler registration
+# ------------------------------------------------------------------
+
+def _make_groupchat_stanza(*, nick, body="hello", room="room@conference.example.org",
+                           delay=False):
+    """Build a fake groupchat stanza whose `from` is room@host/nick."""
+    from_jid = MagicMock()
+    from_jid.bare = room
+    from_jid.resource = nick
+    from_jid.__str__ = lambda self=None: f"{room}/{nick}"  # type: ignore[assignment]
+
+    fields = {"type": "groupchat", "body": body}
+    delay_plugin = object() if delay else None
+
+    stanza = MagicMock()
+    stanza.__getitem__ = lambda self, key: fields.get(key, "")
+    stanza.get = lambda key, default=None: {"muc": None}.get(key, default)
+    stanza.get_from = lambda: from_jid
+    stanza.get_plugin = lambda name, check=False: delay_plugin if name == "delay" else None
+    return stanza
+
+
+@pytest.mark.asyncio
+async def test_muc_self_message_is_dropped(fake_adapter):
+    """A groupchat message carrying our own MUC nick must not be dispatched.
+
+    Regression for issue #6: bare-JID check never matches in a MUC (from is
+    room@host/nick), so the bot replied to its own messages forever.
+    """
+    fake_adapter.muc_nick = "hermes"
+    fake_adapter.muc_rooms = []
+    fake_adapter._known_mucs = {"room@conference.example.org"}
+
+    events = []
+
+    async def _capture(evt):
+        events.append(evt)
+
+    fake_adapter.handle_message = _capture
+
+    stanza = _make_groupchat_stanza(nick="hermes", body="my own message")
+    await fake_adapter._on_message(stanza)
+    assert events == [], "bot dispatched its own MUC message (self-reply loop)"
+
+
+@pytest.mark.asyncio
+async def test_muc_other_user_message_is_dispatched(fake_adapter):
+    """A groupchat message from someone else must still be processed."""
+    fake_adapter.muc_nick = "hermes"
+    fake_adapter.muc_rooms = []
+    fake_adapter._known_mucs = {"room@conference.example.org"}
+
+    events = []
+
+    async def _capture(evt):
+        events.append(evt)
+
+    fake_adapter.handle_message = _capture
+    fake_adapter.build_source = MagicMock(return_value=MagicMock())
+
+    stanza = _make_groupchat_stanza(nick="alice", body="hey bot")
+    await fake_adapter._on_message(stanza)
+    assert len(events) == 1, "legitimate MUC message from another user was dropped"
+
+
+@pytest.mark.asyncio
+async def test_muc_history_replay_is_dropped(fake_adapter):
+    """Delayed (history-replay) groupchat messages must be ignored on join."""
+    fake_adapter.muc_nick = "hermes"
+    fake_adapter.muc_rooms = []
+    fake_adapter._known_mucs = {"room@conference.example.org"}
+
+    events = []
+
+    async def _capture(evt):
+        events.append(evt)
+
+    fake_adapter.handle_message = _capture
+
+    stanza = _make_groupchat_stanza(nick="alice", body="old msg", delay=True)
+    await fake_adapter._on_message(stanza)
+    assert events == [], "stale MUC history replay was dispatched as a live message"
+
+
+def test_on_message_registered_only_once(fake_adapter):
+    """_on_message must be registered for 'message' only, not also
+    'groupchat_message' — otherwise MUC stanzas fire the handler twice.
+
+    Regression for issue #6 (double handling).
+    """
+    import inspect
+    src = inspect.getsource(adapter.XmppAdapter.connect)
+    assert 'add_event_handler("message", self._on_message)' in src
+    assert 'add_event_handler("groupchat_message", self._on_message)' not in src

@@ -1,7 +1,7 @@
 name: hermes-xmpp-plugin
 label: XMPP/Jabber
 kind: platform
-version: 0.3.0
+version: 0.4.0
 description: >
   Third-party XMPP/Jabber gateway platform plugin for Hermes Agent. Supports
   1:1 chat, MUC rooms, typing indicators, message reactions, threaded replies,
@@ -25,6 +25,14 @@ optional_env:
   - name: XMPP_PORT
     description: XMPP client port, defaults to 5222
     prompt: XMPP port
+    password: false
+  - name: XMPP_DIRECT_TLS
+    description: Force direct TLS (XEP-0368) on/off; auto-enabled when XMPP_PORT is 5223
+    prompt: Force direct TLS? true/false
+    password: false
+  - name: XMPP_CONNECT_TIMEOUT_SECS
+    description: How long the background connect watchdog waits for the session to establish before giving up (default 180 seconds); does not block gateway startup. A blackholed IPv6 route can make a connection legitimately take ~130s+ before falling back to IPv4 — raise this further if connects still time out.
+    prompt: Connect timeout in seconds
     password: false
   - name: XMPP_ALLOWED_USERS
     description: Comma-separated bare JIDs allowed to DM the bot

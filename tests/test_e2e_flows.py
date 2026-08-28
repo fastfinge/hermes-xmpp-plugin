@@ -68,8 +68,48 @@ captured_handle_calls = []
 
 def _capture_handle_message(self, event):
     captured_handle_calls.append(event)
+
+
+def _base_init(self, *a, **k):
+    self.config = a[0] if a else None
+    self._fatal_error_code = None
+    self._fatal_error_message = None
+    self._fatal_error_retryable = True
+    self._fatal_error_handler = None
+    self._platform_lock_identity = None
+
+
+def _base_set_fatal_error(self, code, message, *, retryable):
+    self._fatal_error_code = code
+    self._fatal_error_message = message
+    self._fatal_error_retryable = retryable
+
+
+def _base_mark_connected(self):
+    self._fatal_error_code = None
+    self._fatal_error_message = None
+
+
+async def _base_notify_fatal_error(self):
+    handler = getattr(self, "_fatal_error_handler", None)
+    if not handler:
+        return
+    result = handler(self)
+    if asyncio.iscoroutine(result):
+        await result
+
+
+def _base_acquire_platform_lock(self, scope, identity, resource_desc):
+    self._platform_lock_identity = identity
+    return True
+
+
+def _base_release_platform_lock(self):
+    self._platform_lock_identity = None
+
+
 gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
-    "__init__": lambda s, *a, **k: setattr(s, "config", a[0] if a else None) or None,
+    "__init__": _base_init,
     "emit_message_raw": lambda *a, **kw: None,
     "on_processing_start": lambda *a, **kw: None,
     "on_processing_complete": lambda *a, **kw: None,
@@ -77,7 +117,13 @@ gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
     "handle_message": _capture_handle_message,
     "build_source": lambda s, **kw: MagicMock(**kw),
     "_mark_disconnected": lambda s: None,
-    "fatal_error_message": lambda s: getattr(s, "_fatal_msg", None),
+    "_mark_connected": _base_mark_connected,
+    "_set_fatal_error": _base_set_fatal_error,
+    "_notify_fatal_error": _base_notify_fatal_error,
+    "_acquire_platform_lock": _base_acquire_platform_lock,
+    "_release_platform_lock": _base_release_platform_lock,
+    "has_fatal_error": property(lambda s: s._fatal_error_message is not None),
+    "fatal_error_message": property(lambda s: s._fatal_error_message),
 })
 
 gw_models = unittest.mock.MagicMock()
@@ -457,7 +503,7 @@ async def test_standalone_sender_connect_failure():
 
     # Patch connect to fail
     with patch.object(adapter.XmppAdapter, "connect", return_value=False):
-        with patch.object(adapter.XmppAdapter, "fatal_error_message", return_value="auth failed"):
+        with patch.object(adapter.XmppAdapter, "fatal_error_message", property(lambda self: "auth failed")):
             result = await adapter.send_xmpp_message(cfg, "user@example.org", "hi")
     assert result["success"] is False
     assert "auth failed" in result["error"]
@@ -492,6 +538,41 @@ async def test_send_voice_falls_back_to_upload_when_xep_0447_missing(adapter_ins
         result = await adapter_instance.send_voice("user@example.org", "/tmp/voice.ogg")
     assert result.success is True
     mock_up.assert_awaited_once_with("user@example.org", "/tmp/voice.ogg", caption=None)
+
+
+# -----------------------------------------------------------------
+# Media send() methods must accept BasePlatformAdapter's own kwarg names —
+# cron/scheduler.py calls these by keyword (audio_path=/video_path=/
+# file_path=), so a locally-renamed positional arg raises TypeError and the
+# attachment silently never sends.
+# -----------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_voice_accepts_audio_path_kwarg(adapter_instance):
+    adapter_instance._registered_plugins.discard("xep_0447")
+    with patch.object(adapter_instance, "_upload_and_send", new_callable=AsyncMock) as mock_up:
+        mock_up.return_value = adapter.SendResult(success=True, message_id="v1")
+        result = await adapter_instance.send_voice(chat_id="user@example.org", audio_path="/tmp/voice.ogg")
+    assert result.success is True
+    mock_up.assert_awaited_once_with("user@example.org", "/tmp/voice.ogg", caption=None)
+
+
+@pytest.mark.asyncio
+async def test_send_document_accepts_file_path_kwarg(adapter_instance):
+    with patch.object(adapter_instance, "_upload_and_send", new_callable=AsyncMock) as mock_up:
+        mock_up.return_value = adapter.SendResult(success=True, message_id="d1")
+        result = await adapter_instance.send_document(chat_id="user@example.org", file_path="/tmp/report.pdf")
+    assert result.success is True
+    mock_up.assert_awaited_once_with("user@example.org", "/tmp/report.pdf", None)
+
+
+@pytest.mark.asyncio
+async def test_send_video_accepts_video_path_kwarg(adapter_instance):
+    with patch.object(adapter_instance, "_upload_and_send", new_callable=AsyncMock) as mock_up:
+        mock_up.return_value = adapter.SendResult(success=True, message_id="vi1")
+        result = await adapter_instance.send_video(chat_id="user@example.org", video_path="/tmp/clip.mp4")
+    assert result.success is True
+    mock_up.assert_awaited_once_with("user@example.org", "/tmp/clip.mp4", None)
 
 
 # -----------------------------------------------------------------

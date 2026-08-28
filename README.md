@@ -65,6 +65,8 @@ XMPP_ALLOWED_USERS=sam@example.org
 # Optional:
 XMPP_HOST=example.org
 XMPP_PORT=5222
+# XMPP_DIRECT_TLS=true   # force XEP-0368 direct TLS; auto-on when XMPP_PORT=5223
+# XMPP_CONNECT_TIMEOUT_SECS=240  # default 180s; raise further on a slow/high-latency link
 XMPP_MUC_ROOMS=room@conference.example.org/hermes
 XMPP_MUC_NICK=hermes
 XMPP_HOME_CHANNEL=sam@example.org
@@ -159,7 +161,24 @@ supporting XEP-0444, XEP-0461, and XEP-0394.
 ## Troubleshooting
 
 - `xmpp_auth_failed`: wrong JID/password, or server auth policy issue.
-- `xmpp_connect_failed`: DNS/firewall/SRV issue; try `XMPP_HOST`.
+- `xmpp_connect_timeout`: the gateway will report the platform as connected
+  right away (connecting doesn't block gateway startup), but a background
+  watchdog gives up and retries if the session hasn't actually established
+  within `XMPP_CONNECT_TIMEOUT_SECS` (default 180s). A common cause on home
+  networks: DNS returns both an A and AAAA record for the server, the IPv6
+  route is silently blackholed, and the OS burns through its full TCP retry
+  budget (~130s on Linux defaults) before falling back to IPv4 — which then
+  connects instantly. Check `python3 -c "import socket;
+  print(socket.getaddrinfo('your.server', 5222))"` for a AAAA record, test
+  IPv6 reachability separately (`ping6`/`curl -6`), and either fix IPv6
+  routing or disable IPv6 for this host if it's not actually usable. If
+  raising `XMPP_CONNECT_TIMEOUT_SECS` further fixes it, that confirms this
+  cause. Otherwise it's a DNS/firewall/SRV/reachability issue — try
+  `XMPP_HOST`/`XMPP_PORT` or check the server is reachable at all.
+- `xmpp_connection_lost`: an established session dropped unexpectedly (server
+  restart, network blip); the gateway's reconnect watcher should retry.
+- `xmpp_lock`: another gateway process is already logged into this JID; stop
+  it first, or use a separate bot account per gateway.
 - HTTP upload failure: enable XEP-0363 on the server and check max file size.
 - DM rejected: add your bare JID to `XMPP_ALLOWED_USERS`.
 - MUC silent: add room to `XMPP_MUC_ROOMS` and invite the bot.
