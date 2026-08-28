@@ -338,6 +338,16 @@ class XmppAdapter(BasePlatformAdapter):
         self._pending_reactions: Dict[str, Any] = {}
         self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+        # XEP-0004 data forms for clarify: many popular clients (Conversations,
+        # ConverseJS, older Gajim) don't render jabber:x:data forms inside
+        # <message> stanzas.  When the form path is active the body still
+        # carries a numbered fallback list, so disabling forms is rarely
+        # needed — but operators can force pure-text clarify with this flag.
+        self._clarify_forms_disabled: bool = (
+            str(extra.get("disable_clarify_forms", os.getenv("XMPP_DISABLE_CLARIFY_FORMS", "")))
+            .strip().lower() in ("1", "true", "yes")
+        )
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -530,6 +540,46 @@ class XmppAdapter(BasePlatformAdapter):
                         logger.warning("OMEMO: failed to decrypt message from %s: %s", from_bare, exc)
                         return
 
+            # ----------------------------------------------------------------
+            # Inbound XEP-0004 form submission (clarify response)
+            # ----------------------------------------------------------------
+            # When a client renders our data form and the user submits it, the
+            # reply arrives as a <message> with an <x xmlns="jabber:x:data">
+            # child whose type is "submit".  The body is typically empty, so
+            # we must intercept BEFORE the ``if not body: return`` guard
+            # below — otherwise the submission is silently dropped.
+            #
+            # We extract the hidden clarify_id and the answer field, then
+            # resolve the clarify through the gateway.  If anything looks
+            # wrong we fall through to normal message handling so the user's
+            # text (if any) still reaches the agent.
+            #
+            # Clients that don't support data forms will reply with plain
+            # text; that's handled by the text-fallback path in
+            # send_clarify() and the gateway's text-intercept mechanism.
+            form = None
+            try:
+                form = stanza_to_dispatch.get("form", None) if stanza_to_dispatch else None
+            except Exception:
+                pass
+
+            if form is not None:
+                try:
+                    form_type = form.get("type", "")
+                except Exception:
+                    form_type = ""
+                if form_type == "submit":
+                    resolved = self._handle_form_submission(
+                        form=form,
+                        from_bare=from_bare,
+                        from_resource=from_resource,
+                        stanza_type=stanza_type,
+                    )
+                    if resolved:
+                        return
+                    # Fall through: form submission could not be resolved,
+                    # treat as normal message if there's a body.
+
             if not body:
                 return
 
@@ -593,6 +643,69 @@ class XmppAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         except Exception:
             logger.exception("xmpp: error handling inbound stanza")
+
+    def _handle_form_submission(
+        self,
+        form: Any,
+        from_bare: str,
+        from_resource: str,
+        stanza_type: str,
+    ) -> bool:
+        """Process an inbound XEP-0004 form submission (type="submit").
+
+        Extracts the hidden ``clarify_id`` and ``answer`` field from the
+        submitted form and resolves the pending clarify through the gateway.
+
+        Returns True if the submission was recognised and resolved (or
+        definitively handled), False to fall through to normal message
+        processing.
+        """
+        try:
+            fields = form.get_fields(use_dict=True) if hasattr(form, "get_fields") else {}
+            if not fields:
+                # Try get_values as a fallback
+                values = form.get_values() if hasattr(form, "get_values") else {}
+                if not values:
+                    logger.debug("xmpp: form submission has no fields, ignoring")
+                    return False
+                clarify_id = values.get("clarify_id")
+                answer = values.get("answer")
+            else:
+                clarify_id_field = fields.get("clarify_id")
+                answer_field = fields.get("answer")
+                clarify_id = clarify_id_field.get("value") if clarify_id_field else None
+                answer = answer_field.get("value") if answer_field else None
+
+            if not clarify_id:
+                logger.debug("xmpp: form submission missing clarify_id, ignoring")
+                return False
+
+            if answer is None:
+                answer = ""
+
+            # The "__other__" sentinel means the user picked "Other" but
+            # may not have typed a response.  Treat as empty and let the
+            # clarify timeout handle it.
+            if answer == "__other__":
+                answer = ""
+
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = resolve_gateway_clarify(str(clarify_id), str(answer))
+            if resolved:
+                logger.debug(
+                    "xmpp: resolved clarify %s from form submission by %s",
+                    clarify_id, from_bare,
+                )
+                return True
+            else:
+                logger.debug(
+                    "xmpp: form submission for unknown/expired clarify %s from %s",
+                    clarify_id, from_bare,
+                )
+                return True  # Still consume the message — don't double-route
+        except Exception:
+            logger.exception("xmpp: error processing form submission")
+            return False
 
     def _muc_real_jid(self, stanza: Any) -> Optional[str]:
         try:
@@ -1176,7 +1289,7 @@ class XmppAdapter(BasePlatformAdapter):
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
 
-        if not choices or "xep_0004" not in self._registered_plugins:
+        if not choices or "xep_0004" not in self._registered_plugins or self._clarify_forms_disabled:
             # Fallback to text-based clarify
             from tools.clarify_gateway import mark_awaiting_text
             if choices:
@@ -1214,7 +1327,17 @@ class XmppAdapter(BasePlatformAdapter):
             )
 
             msg = self.client.make_message(mto=chat_id, mtype=mtype)
-            msg["body"] = question
+            # Build a numbered text fallback in the body so clients that
+            # don't render jabber:x:data forms (Conversations, ConverseJS,
+            # older Gajim) still show actionable choices instead of a bare
+            # question string.  Clients that DO render the form will show
+            # their native UI; the body is secondary text in that case.
+            body_lines = [f"❓ {question}", ""]
+            for i, choice in enumerate(choices or [], start=1):
+                body_lines.append(f"  {i}. {choice}")
+            body_lines.append("")
+            body_lines.append("Reply with the number, the option text, or your own answer.")
+            msg["body"] = "\n".join(body_lines)
             msg["form"] = form
             msg.send()
 
@@ -1478,6 +1601,11 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         "allow_all_users": "XMPP_ALLOW_ALL_USERS",
         "home_channel": "XMPP_HOME_CHANNEL",
     }
+    # Boolean flags: set env from yaml/config if the env isn't already set.
+    if not os.getenv("XMPP_DISABLE_CLARIFY_FORMS"):
+        raw_disable = raw.get("disable_clarify_forms", extra.get("disable_clarify_forms"))
+        if raw_disable is not None:
+            os.environ["XMPP_DISABLE_CLARIFY_FORMS"] = str(raw_disable)
     for key, env in env_map.items():
         value = raw.get(key, extra.get(key))
         if key == "home_channel" and isinstance(value, dict):

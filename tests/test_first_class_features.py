@@ -452,3 +452,178 @@ async def test_on_message_extracts_reply_context(fake_adapter, fake_client):
     # If events were emitted, check reply context
     if events:
         assert events[0].reply_to_message_id == "orig-id"
+
+
+# ------------------------------------------------------------------
+# B4 — Clarify form body includes numbered fallback (issue #8)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_clarify_form_body_includes_numbered_choices(fake_adapter, fake_client):
+    """When XEP-0004 is active, the message body must still contain a
+    numbered choice list so clients that don't render data forms show
+    actionable text instead of a bare question."""
+    xep0004 = MagicMock()
+    fake_form = MagicMock()
+    xep0004.make_form.return_value = fake_form
+    fake_client.plugins["xep_0004"] = xep0004
+
+    fake_msg = MagicMock()
+    fake_client.make_message.return_value = fake_msg
+
+    choices = ["Option A", "Option B"]
+    result = await fake_adapter.send_clarify(
+        chat_id="user@example.org",
+        question="Pick one",
+        choices=choices,
+        clarify_id="clarify-1",
+        session_key="sess-1",
+    )
+    assert result.success is True
+    # The body must contain numbered choices, not just the bare question
+    body = fake_msg.__setitem__.call_args_list
+    # Find the body assignment
+    body_value = None
+    for call in body:
+        if call.args and call.args[0] == "body":
+            body_value = call.args[1]
+            break
+    assert body_value is not None, "msg['body'] was never set"
+    assert "1." in body_value, f"Numbered choices missing from body: {body_value}"
+    assert "Option A" in body_value, f"Choice text missing from body: {body_value}"
+    assert "2." in body_value
+    assert "Option B" in body_value
+
+
+# ------------------------------------------------------------------
+# B5 — Clarify forms can be disabled via config (issue #8)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_clarify_falls_back_to_text_when_forms_disabled(fake_adapter, fake_client):
+    """When _clarify_forms_disabled is True, send_clarify should use the
+    text fallback path even if xep_0004 is registered."""
+    fake_adapter._clarify_forms_disabled = True
+    fake_adapter.client = fake_client
+
+    choices = ["A", "B"]
+    result = await fake_adapter.send_clarify(
+        chat_id="user@example.org",
+        question="Pick one",
+        choices=choices,
+        clarify_id="clarify-1",
+        session_key="sess-1",
+    )
+    assert result.success is True
+    # Should NOT have called make_form (text path uses send() → make_message)
+    xep0004 = fake_client.plugins.get("xep_0004")
+    if xep0004:
+        xep0004.make_form.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# B6 — Inbound form submission resolves clarify (issue #8)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_on_message_handles_form_submission(fake_adapter, fake_client):
+    """When a submitted XEP-0004 form arrives, _on_message should extract
+    clarify_id + answer and resolve the clarify instead of dropping it."""
+
+    # Build a fake submitted form
+    fake_clarify_id_field = MagicMock()
+    fake_clarify_id_field.get = MagicMock(return_value="clarify-abc")
+    fake_answer_field = MagicMock()
+    fake_answer_field.get = MagicMock(return_value="Option A")
+
+    fake_form = MagicMock()
+    fake_form.get = MagicMock(return_value="submit")
+    fake_form.get_fields = MagicMock(return_value={
+        "clarify_id": fake_clarify_id_field,
+        "answer": fake_answer_field,
+    })
+
+    stanza = MagicMock()
+    # __getitem__ must return proper values for "type" and "body"
+    _item_map = {"type": "chat", "body": "", "form": fake_form}
+    stanza.__getitem__ = lambda self, key, m=_item_map: m.get(key)
+    stanza.get_from.return_value = MagicMock(bare="user@example.org", resource="desktop")
+    stanza.get = MagicMock(side_effect=lambda key, default=None: {
+        "id": "msg-form-1",
+        "reply": None,
+        "form": fake_form,
+    }.get(key, default))
+
+    # Track whether resolve_gateway_clarify was called
+    resolve_called = []
+
+    def fake_resolve(cid, answer):
+        resolve_called.append((cid, answer))
+        return True
+
+    # Set resolve_gateway_clarify on whatever mock/module is currently in
+    # sys.modules.  Other test files (test_regression, test_omemo) replace
+    # sys.modules["tools.clarify_gateway"] at collection time, so the
+    # module-level tools_gateway variable may be stale.
+    import sys as _sys
+    cg_mod = _sys.modules.get("tools.clarify_gateway")
+    assert cg_mod is not None, "tools.clarify_gateway not in sys.modules"
+    cg_mod.resolve_gateway_clarify = fake_resolve
+
+    fake_adapter.allow_all_users = True
+
+    events = []
+    async def _capture(evt):
+        events.append(evt)
+    fake_adapter.handle_message = _capture
+
+    try:
+        await fake_adapter._on_message(stanza)
+    finally:
+        # Restore: delete the attribute so it auto-mocks again
+        try:
+            del cg_mod.resolve_gateway_clarify
+        except AttributeError:
+            pass
+
+    assert len(resolve_called) == 1, f"resolve_gateway_clarify should be called once, got {resolve_called}"
+    assert resolve_called[0][0] == "clarify-abc"
+    assert resolve_called[0][1] == "Option A"
+    # The message should NOT be passed to handle_message (it was consumed)
+    assert len(events) == 0, "Form submission should not trigger handle_message"
+
+
+# ------------------------------------------------------------------
+# B7 — Form submission with no body does not crash (issue #8)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_on_message_form_submission_no_body_no_crash(fake_adapter, fake_client):
+    """A form submission with empty body should not hit the 'if not body:
+    return' guard and get silently dropped."""
+
+    fake_form = MagicMock()
+    fake_form.get = MagicMock(return_value="submit")
+    fake_form.get_fields = MagicMock(return_value={})  # no fields
+    fake_form.get_values = MagicMock(return_value={})
+
+    stanza = MagicMock()
+    # __getitem__ must return proper values for "type" and "body"
+    _item_map = {"type": "chat", "body": "", "form": fake_form}
+    stanza.__getitem__ = lambda self, key, m=_item_map: m.get(key)
+    stanza.get_from.return_value = MagicMock(bare="user@example.org", resource="desktop")
+    stanza.get = MagicMock(side_effect=lambda key, default=None: {
+        "id": "msg-form-2",
+        "reply": None,
+        "form": fake_form,
+    }.get(key, default))
+
+    fake_adapter.allow_all_users = True
+    events = []
+    async def _capture(evt):
+        events.append(evt)
+    fake_adapter.handle_message = _capture
+
+    # Should not crash, should not emit an event (empty form with no clarify_id)
+    await fake_adapter._on_message(stanza)
+    assert len(events) == 0

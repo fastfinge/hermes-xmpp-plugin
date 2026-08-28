@@ -196,9 +196,22 @@ When Hermes needs clarification, the adapter sends an XEP-0004 data form instead
 of a plain text list. The form includes:
 - A hidden `clarify_id` field
 - A list-single choice field with the available options
+- An "Other (type your own answer)" option for free-form responses
 
-Users pick one option and submit it. The adapter reads the form response and
-forwards it back to Hermes.
+The message body also includes a numbered text fallback so that clients which
+do not render `jabber:x:data` forms in `<message>` stanzas (Conversations,
+ConverseJS, older Gajim) still display actionable choices. Users on those
+clients can reply with the number or option text as normal.
+
+When a client does render the form and the user submits it, the adapter reads
+the form response, extracts the `clarify_id` and selected answer, and resolves
+the clarification back to Hermes automatically.
+
+**Disabling data forms:** If you prefer to always use plain text clarify
+(never send XEP-0004 forms), set the environment variable
+`XMPP_DISABLE_CLARIFY_FORMS=true` or add `disable_clarify_forms: true` to your
+XMPP platform config in `config.yaml`. This forces the numbered text fallback
+path even when the `xep_0004` plugin is registered.
 
 ### Voice messages (XEP-0447)
 
