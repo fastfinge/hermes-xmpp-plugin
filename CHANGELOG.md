@@ -123,6 +123,23 @@ All notable changes to this project will be documented in this file.
   cancelling a task mid-flight through slixmpp's aiodns/pycares (c-ares)
   DNS resolution.
 
+### Fixed
+
+- **Clarify form body includes numbered fallback** (issue #8): When XEP-0004
+  data forms are sent, the message body now contains a numbered choice list
+  (identical to the text fallback path) instead of a bare question string.
+  Clients that don't render `jabber:x:data` forms in `<message>` stanzas
+  (Conversations, ConverseJS, older Gajim) now display actionable choices.
+- **Inbound form submission handling** (issue #8): Submitted XEP-0004 forms
+  are now parsed in `_on_message` — the hidden `clarify_id` and `answer`
+  field are extracted and the clarify is resolved through the gateway.
+  Previously, form submissions were silently dropped because they typically
+  have an empty `<body>` and the early-return guard discarded them.
+- **Config toggle to disable data forms** (issue #8): Set
+  `XMPP_DISABLE_CLARIFY_FORMS=true` (env) or `disable_clarify_forms: true`
+  (config.yaml) to force the numbered text fallback path even when the
+  `xep_0004` plugin is registered.
+
 ## [0.3.0] — First-class XMPP
 
 ### Added
