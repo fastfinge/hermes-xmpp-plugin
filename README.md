@@ -66,6 +66,7 @@ XMPP_ALLOWED_USERS=sam@example.org
 XMPP_HOST=example.org
 XMPP_PORT=5222
 # XMPP_DIRECT_TLS=true   # force XEP-0368 direct TLS; auto-on when XMPP_PORT=5223
+# XMPP_USE_IPV6=false    # disable IPv6 (default: auto-detect a working global v6 route)
 # XMPP_CONNECT_TIMEOUT_SECS=240  # default 180s; raise further on a slow/high-latency link
 XMPP_MUC_ROOMS=room@conference.example.org/hermes
 XMPP_MUC_NICK=hermes

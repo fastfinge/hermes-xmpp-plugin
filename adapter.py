@@ -345,6 +345,42 @@ def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
     return rooms
 
 
+def _has_working_ipv6_route() -> bool:
+    """Cheap heuristic: a global (non-link-local, non-ULA) default IPv6 route
+    *and* a global source address suggest v6 actually works. A bare default
+    route from a broken RA without upstream v6 (observed here: v6 SYNs simply
+    time out) fails the source-address check — better to fall back to IPv4
+    than to hang AAAA-first connection attempts forever."""
+    try:
+        import socket as _socket
+
+        has_default = False
+        try:
+            with open("/proc/net/if_inet6", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        addr_hex, scope = parts[0], parts[4]
+                        # scope 0x00 = global; skip fe80::/10 link-local and
+                        # fc00::/7 ULA (no guaranteed global reachability)
+                        if scope == "00" and not addr_hex.lower().startswith(("fe8", "fe9", "fea", "feb", "fc", "fd")):
+                            has_default = True
+                            break
+        except OSError:
+            return False
+        if not has_default:
+            return False
+        _s = _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM)
+        try:
+            _s.connect(("2001:4860:4860::8888", 53))
+            src = _s.getsockname()[0]
+            return not (src.startswith("fe80") or src.startswith("fc") or src.startswith("fd"))
+        finally:
+            _s.close()
+    except Exception:
+        return False
+
+
 # ----------------------------------------------------------------
 # Adapter
 # ----------------------------------------------------------------
@@ -452,6 +488,22 @@ class XmppAdapter(BasePlatformAdapter):
         self._password: str = str(extra.get("password") or os.getenv("XMPP_PASSWORD", ""))
         self.host: Optional[str] = extra.get("host") or os.getenv("XMPP_HOST") or None
         self.port: int = int(extra.get("port") or os.getenv("XMPP_PORT", 5222))
+        # IPv6 tri-state: None = auto-detect a working global v6 route at
+        # connect time. Explicit true/false via XMPP_USE_IPV6 / use_ipv6.
+        # NOTE: a YAML `use_ipv6: false` arrives as a real Python bool, and
+        # `or` would swallow a False literal back into auto-detect — so check
+        # key presence explicitly before falling back to the env var.
+        _use_ipv6_cfg = extra.get("use_ipv6")
+        if _use_ipv6_cfg is None:
+            _use_ipv6_cfg = os.getenv("XMPP_USE_IPV6")
+        _use_ipv6_raw = str(_use_ipv6_cfg).strip().lower()
+        self._use_ipv6: Optional[bool]
+        if _use_ipv6_raw in ("1", "true", "yes", "on"):
+            self._use_ipv6 = True
+        elif _use_ipv6_raw in ("0", "false", "no", "off"):
+            self._use_ipv6 = False
+        else:
+            self._use_ipv6 = None
 
         # Direct TLS ("TLS from byte one", XEP-0368 — the classic port-5223
         # posture). Auto-enabled when the operator points us at port 5223,
@@ -573,6 +625,23 @@ class XmppAdapter(BasePlatformAdapter):
                 return False
 
         client = ClientXMPP(self.jid, self._password)
+        # IPv6 gate: on hosts with no working global IPv6 route, an AAAA-first
+        # address list makes create_connection() hang on the v6 address
+        # indefinitely (no per-attempt timeout) — the adapter's connect
+        # watchdog then fires xmpp_connect_timeout every cycle while the
+        # perfectly reachable IPv4 address is never tried. Parsed in
+        # __init__ (self._use_ipv6: True/False/None=auto) alongside the
+        # other enable_* knobs; overridable via XMPP_USE_IPV6 / use_ipv6.
+        if self._use_ipv6 is True:
+            client.use_ipv6 = True
+        elif self._use_ipv6 is False:
+            client.use_ipv6 = False
+        else:  # auto: trust a working global v6 route if one exists
+            client.use_ipv6 = _has_working_ipv6_route()
+        if not client.use_ipv6:
+            logger.info(
+                "xmpp: IPv6 disabled for this connection (no working global v6 route, or use_ipv6=false)"
+            )
         # Plugins - core
         for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0203", "xep_0363", "xep_0380"):
             try:
