@@ -267,6 +267,86 @@ class TestFileHelpers:
         """send_voice must accept voice_path and delegate correctly."""
         assert callable(getattr(adapter_instance, "send_voice", None))
 
+    @pytest.mark.asyncio
+    async def test_upload_passes_path_not_input_file(self, adapter_instance, tmp_path):
+        """Issue #10: XEP-0363 upload_file() requires input_file to be a
+        binary stream (IO[bytes]). Passing a path string made slixmpp skip
+        its own open() and call input_file.seek(0, 2) on a str →
+        AttributeError: 'str' object has no attribute 'seek' → every
+        attachment failed with "couldn't deliver the file attachment".
+
+        The adapter must pass the FULL path as `filename` (slixmpp opens
+        the file itself when input_file is omitted, and derives the slot's
+        basename internally) and must NOT pass input_file at all."""
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 fake")
+
+        adapter_instance.client = MagicMock()
+        adapter_instance._registered_plugins = {"xep_0363"}
+        adapter_instance._running = True
+        adapter_instance.client.send_message = MagicMock(
+            return_value=MagicMock(__getitem__=lambda s, k: "id1")
+        )
+
+        captured = {}
+
+        async def _fake_upload(**kwargs):
+            captured.update(kwargs)
+            # Reproduce slixmpp's real contract check: input_file, if
+            # present, must have .seek()
+            if kwargs.get("input_file") is not None and not hasattr(
+                kwargs["input_file"], "seek"
+            ):
+                raise AttributeError(
+                    "'str' object has no attribute 'seek'"
+                )
+            return "https://upload.example.org/report.pdf"
+
+        adapter_instance.client["xep_0363"].upload_file = _fake_upload
+
+        result = await adapter_instance._upload_and_send(
+            "user@example.org", str(f), None
+        )
+        assert result.success is True
+        assert "input_file" not in captured or captured["input_file"] is None
+        assert captured["filename"] == str(f)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_passes_path_not_input_file(self, adapter_instance, tmp_path):
+        """Issue #10, send_voice path: same contract as _upload_and_send."""
+        f = tmp_path / "voice.ogg"
+        f.write_bytes(b"OggS-fake")
+
+        adapter_instance.client = MagicMock()
+        adapter_instance._registered_plugins = {"xep_0363", "xep_0447"}
+        adapter_instance._running = True
+        sfs_mock = MagicMock()
+        adapter_instance.client["xep_0447"].get_sfs.return_value = sfs_mock
+        msg_mock = MagicMock()
+        msg_mock.__getitem__ = lambda s, k: "id2"
+        adapter_instance.client.make_message.return_value = msg_mock
+
+        captured = {}
+
+        async def _fake_upload(**kwargs):
+            captured.update(kwargs)
+            if kwargs.get("input_file") is not None and not hasattr(
+                kwargs["input_file"], "seek"
+            ):
+                raise AttributeError(
+                    "'str' object has no attribute 'seek'"
+                )
+            return "https://upload.example.org/voice.ogg"
+
+        adapter_instance.client["xep_0363"].upload_file = _fake_upload
+
+        result = await adapter_instance.send_voice(
+            "user@example.org", str(f)
+        )
+        assert result.success is True
+        assert "input_file" not in captured or captured["input_file"] is None
+        assert captured["filename"] == str(f)
+
 
 # -----------------------------------------------------------------
 # 5. OMEMO storage still works (file-backed JSON)

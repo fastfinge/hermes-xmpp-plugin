@@ -1721,9 +1721,17 @@ class XmppAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         content_type, _ = mimetypes.guess_type(path)
+        # XEP-0363 upload_file(): `input_file` must be a binary file object
+        # (IO[bytes]), never a path string — slixmpp skips its own open()
+        # whenever input_file is not None and calls input_file.seek(0, 2)
+        # to size the upload, so a str raised "AttributeError: 'str' object
+        # has no attribute 'seek'" and every attachment failed with
+        # "couldn't deliver the file attachment" (issue #10). Passing the
+        # full path as `filename` alone is sufficient and correct: slixmpp
+        # opens the file itself (when input_file is omitted) and derives
+        # the slot's basename via os.path.basename().
         upload_kwargs: Dict[str, Any] = {
-            "filename": Path(path).name,
-            "input_file": path,
+            "filename": path,
         }
         if content_type:
             upload_kwargs["content_type"] = content_type
@@ -1961,9 +1969,11 @@ class XmppAdapter(BasePlatformAdapter):
             return await self._upload_and_send(chat_id, audio_path, caption=None)
 
         content_type, _ = mimetypes.guess_type(audio_path)
+        # Same as _upload_and_send(): `input_file` must be a binary stream,
+        # not a path string (issue #10) — pass the full path as `filename`
+        # only and let slixmpp open the file itself.
         upload_kwargs: Dict[str, Any] = {
-            "filename": Path(audio_path).name,
-            "input_file": audio_path,
+            "filename": audio_path,
         }
         if content_type:
             upload_kwargs["content_type"] = content_type
