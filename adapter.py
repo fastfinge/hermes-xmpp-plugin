@@ -2122,9 +2122,78 @@ def _csv(value: Any) -> str:
     return str(value).strip()
 
 
+# ---------------------------------------------------------------------
+# Credential probing (cron delivery preflight & platform enablement)
+# ---------------------------------------------------------------------
+
+_DOTENV_PEEK_CACHE: dict[tuple, dict] = {}
+
+
+def _dotenv_peek(key: str) -> str:
+    """Non-mutating read of ``key`` from the Hermes ``.env``.
+
+    Credentials live in ``$HERMES_HOME/.env``, but some asking processes — notably
+    cron's delivery preflight (``cron/scheduler_preflight.py``) — probe plugin
+    platforms *before* their own dotenv pass, so ``XMPP_JID``/``XMPP_PASSWORD``
+    are not yet in ``os.environ``. This peek fills that gap WITHOUT exporting
+    anything: process env always wins, the file is only read, and a missing or
+    unparsable file simply yields ``""`` (same verdict as before this existed).
+    """
+    home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    path = os.path.join(home, ".env")
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return ""
+    cache_key = (path, mtime)
+    cached = _DOTENV_PEEK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.get(key, "")
+    values: dict[str, str] = {}
+    try:
+        from dotenv import dotenv_values
+
+        for k, v in (dotenv_values(path) or {}).items():
+            if isinstance(k, str) and isinstance(v, str):
+                values[k] = v
+    except Exception:
+        # dotenv unavailable (standalone tests, foreign harness): minimal manual
+        # parse — enough for the plain KEY=value lines Hermes itself writes.
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    if k.startswith("export "):
+                        k = k[len("export "):].strip()
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                        v = v[1:-1]
+                    if k:
+                        values[k] = v
+        except Exception:
+            return ""
+    _DOTENV_PEEK_CACHE.clear()
+    _DOTENV_PEEK_CACHE[cache_key] = values
+    return values.get(key, "")
+
+
+def _xmpp_credentials(config: PlatformConfig) -> tuple[str, str]:
+    """(jid, password) from config.extra, process env, or the .env peek — in that
+    priority order. Read-only; never exports into ``os.environ``."""
+    extra = getattr(config, "extra", {}) or {}
+    jid = (extra.get("jid") or os.getenv("XMPP_JID") or _dotenv_peek("XMPP_JID") or "").strip()
+    password = (
+        extra.get("password") or os.getenv("XMPP_PASSWORD") or _dotenv_peek("XMPP_PASSWORD") or ""
+    ).strip()
+    return jid, password
+
+
 def _env_enablement() -> Optional[dict[str, Any]]:
-    jid = os.getenv("XMPP_JID", "").strip()
-    password = os.getenv("XMPP_PASSWORD", "").strip()
+    jid, password = _xmpp_credentials(PlatformConfig())
     if not (jid and password):
         return None
     data: dict[str, Any] = {"jid": jid, "password": password}
@@ -2196,8 +2265,8 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
 
 
 def validate_config(config: PlatformConfig) -> bool:
-    extra = getattr(config, "extra", {}) or {}
-    return bool((extra.get("jid") or os.getenv("XMPP_JID")) and (extra.get("password") or os.getenv("XMPP_PASSWORD")))
+    jid, password = _xmpp_credentials(config)
+    return bool(jid and password)
 
 
 def is_connected(config: PlatformConfig) -> bool:
