@@ -19,6 +19,13 @@ sys.path.insert(0, str(ROOT))
 
 import unittest.mock
 
+# Snapshot the pristine sys.modules BEFORE any fakes are installed below —
+# restored after ``import adapter`` so later-imported test files see the real
+# world (test_connect_resilience needs the REAL slixmpp_omemo, not our mock).
+from conftest import snapshot_sys_modules, restore_sys_modules
+
+_MODULES_SNAPSHOT = snapshot_sys_modules()
+
 # -----------------------------------------------------------------
 # Build mock gateway / tools modules so adapter.py can import cleanly
 # -----------------------------------------------------------------
@@ -130,6 +137,10 @@ adapter.MessageEvent = gw_base.MessageEvent
 adapter.MessageType = gw_base.MessageType
 adapter.ProcessingOutcome = gw_base.ProcessingOutcome
 adapter.SendResult = gw_base.SendResult
+
+# Fakes are baked into this module's ``adapter`` object — restore the real
+# modules for whoever gets imported next.
+restore_sys_modules(_MODULES_SNAPSHOT)
 
 
 # ------------------------------------------------------------------

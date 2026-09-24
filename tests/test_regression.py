@@ -22,8 +22,22 @@ sys.path.insert(0, str(ROOT))
 import unittest.mock
 
 # -----------------------------------------------------------------
-# Mock gateway / tools — same set-up as test_e2e_flows.py
+# Mock gateway / tools — same set-up as test_e2e_flows.py, plus the
+# sys.modules eviction that keeps this file order-independent (a file
+# imported earlier may have cached an adapter built against ITS fakes;
+# evict so our import below always re-executes adapter.py against ours).
+# After import, sys.modules is RESTORED (conftest helpers) so our omemo
+# mocks don't poison test_connect_resilience, which needs real slixmpp_omemo.
 # -----------------------------------------------------------------
+from conftest import snapshot_sys_modules, restore_sys_modules
+
+_MODULES_SNAPSHOT = snapshot_sys_modules()
+
+for key in list(sys.modules.keys()):
+    if key == "adapter" or key.startswith("adapter.") or key.startswith("gateway") \
+            or key == "tools" or key.startswith("tools."):
+        del sys.modules[key]
+
 gateway_mod = unittest.mock.MagicMock()
 sys.modules["gateway"] = gateway_mod
 
@@ -117,6 +131,10 @@ omemo_types.DeviceInformation = type("DeviceInformation", (), {})
 omemo_types.JSONType = type("JSONType", (), {})
 
 import adapter  # noqa: E402
+
+# Fakes are baked into this module's ``adapter``; restore the real modules
+# (gateway/tools/omemo) for later-imported test files.
+restore_sys_modules(_MODULES_SNAPSHOT)
 
 ProcessingOutcome = _FakeProcessingOutcome
 

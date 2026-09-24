@@ -7,7 +7,20 @@ from pathlib import Path
 import pytest
 import unittest.mock
 
-# Mock gateway modules before importing adapter
+from conftest import snapshot_sys_modules, restore_sys_modules
+
+# Mock gateway modules before importing adapter. The eviction matters: pytest
+# imports every test file into ONE process, and files imported earlier leave
+# their adapter copy (built against whatever fakes were installed at that
+# moment) cached in sys.modules. Evicting adapter + our fake targets here means
+# THIS file always gets a fresh adapter built against the fakes below, no
+# matter what ran before it (order-independence).
+_MODULES_SNAPSHOT = snapshot_sys_modules()
+for key in list(sys.modules.keys()):
+    if key == "adapter" or key.startswith("adapter.") or key.startswith("gateway") \
+            or key == "tools" or key.startswith("tools."):
+        del sys.modules[key]
+
 for m in ["gateway", "gateway.config", "gateway.platforms", "gateway.platforms.base",
           "gateway.platforms.models", "gateway.util", "tools", "tools.clarify_gateway"]:
     sys.modules[m] = unittest.mock.MagicMock()
@@ -16,6 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import adapter  # noqa: E402
+
+# Fakes are baked into this module's ``adapter``; restore the real modules
+# for later-imported test files.
+restore_sys_modules(_MODULES_SNAPSHOT)
 
 
 @pytest.fixture(autouse=True)

@@ -20,6 +20,13 @@ sys.path.insert(0, str(ROOT))
 
 import unittest.mock
 
+# Snapshot pristine sys.modules BEFORE any fakes below; restored after our
+# ``import adapter`` so later-imported files see the real world (notably
+# test_connect_resilience, which needs the REAL slixmpp_omemo installed here).
+from conftest import snapshot_sys_modules, restore_sys_modules
+
+_MODULES_SNAPSHOT = snapshot_sys_modules()
+
 # -----------------------------------------------------------------
 # Mock gateway / tools so adapter.py imports cleanly
 # -----------------------------------------------------------------
@@ -173,6 +180,10 @@ for key in list(sys.modules.keys()):
         del sys.modules[key]
 
 import adapter  # noqa: E402
+
+# Fakes are baked into this module's ``adapter``; restore the real modules
+# (gateway/tools/omemo) for later-imported test files.
+restore_sys_modules(_MODULES_SNAPSHOT)
 
 ProcessingOutcome = _FakeProcessingOutcome
 
