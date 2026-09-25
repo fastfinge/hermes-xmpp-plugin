@@ -473,7 +473,7 @@ class XmppAdapter(BasePlatformAdapter):
         # back to the class default on any bad value.
         _connect_timeout_raw = None
         if isinstance(extra, dict):
-            _connect_timeout_raw = extra.get("connect_timeout_secs") or os.getenv("XMPP_CONNECT_TIMEOUT_SECS")
+            _connect_timeout_raw = extra.get("connect_timeout_secs") or _scoped_getenv("XMPP_CONNECT_TIMEOUT_SECS")
         if _connect_timeout_raw:
             try:
                 _connect_timeout = float(_connect_timeout_raw)
@@ -484,10 +484,10 @@ class XmppAdapter(BasePlatformAdapter):
                     "xmpp: invalid connect_timeout_secs %r, using default", _connect_timeout_raw
                 )
 
-        self.jid: str = str(extra.get("jid") or os.getenv("XMPP_JID", ""))
-        self._password: str = str(extra.get("password") or os.getenv("XMPP_PASSWORD", ""))
-        self.host: Optional[str] = extra.get("host") or os.getenv("XMPP_HOST") or None
-        self.port: int = int(extra.get("port") or os.getenv("XMPP_PORT", 5222))
+        self.jid: str = str(extra.get("jid") or _scoped_getenv("XMPP_JID", "")).strip()
+        self._password: str = str(extra.get("password") or _scoped_getenv("XMPP_PASSWORD", "")).strip()
+        self.host: Optional[str] = extra.get("host") or _scoped_getenv("XMPP_HOST") or None
+        self.port: int = int(extra.get("port") or _scoped_getenv("XMPP_PORT", "5222") or 5222)
         # IPv6 tri-state: None = auto-detect a working global v6 route at
         # connect time. Explicit true/false via XMPP_USE_IPV6 / use_ipv6.
         # NOTE: a YAML `use_ipv6: false` arrives as a real Python bool, and
@@ -526,9 +526,9 @@ class XmppAdapter(BasePlatformAdapter):
         )
 
         # Allow-list
-        allow_all_raw = str(extra.get("allow_all_users", os.getenv("XMPP_ALLOW_ALL_USERS", "")))
+        allow_all_raw = str(extra.get("allow_all_users", _scoped_getenv("XMPP_ALLOW_ALL_USERS", "")))
         self.allow_all_users: bool = allow_all_raw.strip().lower() in ("1", "true", "yes")
-        allowed_env = str(extra.get("allowed_users") or os.getenv("XMPP_ALLOWED_USERS", "")).strip()
+        allowed_env = str(extra.get("allowed_users") or _scoped_getenv("XMPP_ALLOWED_USERS", "")).strip()
         self.allowed_users = {j.strip() for j in allowed_env.split(",") if j.strip()}
 
         # OMEMO
@@ -546,7 +546,7 @@ class XmppAdapter(BasePlatformAdapter):
             (omemo_cfg.get("storage_path") if isinstance(omemo_cfg, dict) else None)
             or extra.get("omemo_storage_path")
             or os.getenv("XMPP_OMEMO_STORAGE_PATH", "")
-        ) or str(Path(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "xmpp_omemo.json")
+        ) or str(Path(_hermes_home()) / "xmpp_omemo.json")
         self._omemo_initialized = asyncio.Event()
         self._omemo_initialized_occurred = False
 
@@ -2129,6 +2129,20 @@ def _csv(value: Any) -> str:
 _DOTENV_PEEK_CACHE: dict[tuple, dict] = {}
 
 
+def _hermes_home() -> str:
+    """``$HERMES_HOME`` honouring the contextvar home override the multiplexing
+    gateway installs around each profile's work, else the process env, else
+    ``~/.hermes``. Secondary adapters MUST resolve their home through here —
+    raw ``os.environ["HERMES_HOME"]`` always names the LAUNCH profile's home,
+    which is how per-profile state (the .env peek, OMEMO storage) silently
+    collapsed onto the default profile's files under ``multiplex_profiles``."""
+    try:
+        from hermes_constants import get_hermes_home  # lazy: optional seam
+        return str(get_hermes_home())
+    except Exception:
+        return os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+
+
 def _dotenv_peek(key: str) -> str:
     """Non-mutating read of ``key`` from the Hermes ``.env``.
 
@@ -2138,8 +2152,11 @@ def _dotenv_peek(key: str) -> str:
     are not yet in ``os.environ``. This peek fills that gap WITHOUT exporting
     anything: process env always wins, the file is only read, and a missing or
     unparsable file simply yields ``""`` (same verdict as before this existed).
+    Home resolves through :func:`_hermes_home` (contextvar override aware), so
+    a multiplexed secondary reads ITS OWN profile's ``.env``, never the launch
+    profile's.
     """
-    home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    home = _hermes_home()
     path = os.path.join(home, ".env")
     try:
         mtime = os.stat(path).st_mtime
@@ -2181,13 +2198,66 @@ def _dotenv_peek(key: str) -> str:
     return values.get(key, "")
 
 
+def _multiplex_active() -> bool:
+    """Whether this process is a profile multiplexer (one process, many
+    profiles). When True, ``os.environ`` belongs to the LAUNCH profile — every
+    other profile must resolve credentials from its own scope/``.env`` instead
+    of borrowing the launch profile's env (which once made every secondary XMPP
+    adapter bind the default profile's JID)."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return bool(is_multiplex_active())
+    except Exception:
+        return False
+
+
+def _scoped_getenv(name: str, default: str = "", *, peek: bool = False) -> str:
+    """``os.getenv`` honouring the active profile's secret scope.
+
+    Resolution order: ``agent.secret_scope.get_secret`` (the per-profile
+    contextvar mapping the multiplexing gateway installs around each profile's
+    adapters and turns — falls back to ``os.environ`` on single-profile hosts),
+    then, only when multiplexing is INACTIVE, the process env and — for
+    ``peek=True`` names only — the cron preflight ``.env`` peek. Under
+    multiplexing an unscoped read fails closed to ``default`` rather than
+    borrowing the launch profile's value: a wrong credential is worse than none
+    (three adapters, one JID, each rejecting its own owner's allowlist — the
+    exact bug this fixes). Without the secret-scope machinery (foreign harness,
+    plain plugin install), legacy single-profile resolution applies.
+
+    ``peek`` is for the credential pair only: the cron preflight runs before
+    its dotenv pass and must still see XMPP_JID/XMPP_PASSWORD in
+    ``$HERMES_HOME/.env`` to judge whether an XMPP gateway is configured.
+    Tuning vars must NOT peek — a developer-machine ``.env`` would otherwise
+    override the class defaults of every bare test config (the
+    connect-timeout regression)."""
+    try:
+        from agent.secret_scope import get_secret
+    except Exception:
+        # No secret-scope machinery at all: classic single-profile resolution.
+        return os.getenv(name, "") or (_dotenv_peek(name) if peek else "") or default
+    try:
+        value = get_secret(name, None)
+    except Exception:
+        # UnscopedSecretError (multiplexed, no scope installed): fail closed —
+        # never fall through to os.environ, that is the cross-profile leak.
+        return default
+    if value is not None:
+        return str(value)
+    if _multiplex_active():
+        return default
+    # Single-profile host / cron preflight: legacy resolution preserved.
+    return os.getenv(name, "") or (_dotenv_peek(name) if peek else "") or default
+
+
 def _xmpp_credentials(config: PlatformConfig) -> tuple[str, str]:
-    """(jid, password) from config.extra, process env, or the .env peek — in that
-    priority order. Read-only; never exports into ``os.environ``."""
+    """(jid, password) from config.extra, the profile-scoped env, or the .env
+    peek — in that priority order. Read-only; never exports into
+    ``os.environ``."""
     extra = getattr(config, "extra", {}) or {}
-    jid = (extra.get("jid") or os.getenv("XMPP_JID") or _dotenv_peek("XMPP_JID") or "").strip()
+    jid = (extra.get("jid") or _scoped_getenv("XMPP_JID", peek=True) or "").strip()
     password = (
-        extra.get("password") or os.getenv("XMPP_PASSWORD") or _dotenv_peek("XMPP_PASSWORD") or ""
+        extra.get("password") or _scoped_getenv("XMPP_PASSWORD", peek=True) or ""
     ).strip()
     return jid, password
 
@@ -2207,7 +2277,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         ("XMPP_ALLOWED_USERS", "allowed_users"),
         ("XMPP_ALLOW_ALL_USERS", "allow_all_users"),
     ):
-        value = os.getenv(env, "").strip()
+        value = _scoped_getenv(env).strip()
         if value:
             data[key] = value
     return data
@@ -2254,11 +2324,18 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         raw_disable = raw.get("disable_clarify_forms", extra.get("disable_clarify_forms"))
         if raw_disable is not None:
             os.environ["XMPP_DISABLE_CLARIFY_FORMS"] = str(raw_disable)
+    # Under multiplexing the process env is SHARED by every profile's adapter:
+    # exporting one profile's XMPP_* value here would stomp (or be stomped by)
+    # another profile's — the launch profile's block must never set another
+    # tenant's env. Values stay in `extra`, which every read resolves first.
+    _multiplex = _multiplex_active()
     for key, env in env_map.items():
         value = raw.get(key, extra.get(key))
         if key == "home_channel" and isinstance(value, dict):
             value = value.get("chat_id")
         if value is None or os.getenv(env):
+            continue
+        if _multiplex:
             continue
         os.environ[env] = _csv(value)
     return extra or None
