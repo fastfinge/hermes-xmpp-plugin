@@ -139,8 +139,17 @@ adapter.ProcessingOutcome = gw_base.ProcessingOutcome
 adapter.SendResult = gw_base.SendResult
 
 # Fakes are baked into this module's ``adapter`` object — restore the real
-# modules for whoever gets imported next.
+# modules for whoever gets imported next. EXCEPTION: the fake ``tools``
+# modules must stay installed: adapter imports ``tools.clarify_gateway``
+# LAZILY at call time (send_clarify / _on_message form handling), after this
+# restore has run. In production ``tools`` is the gateway's own package and
+# always importable; a standalone plugin checkout has neither the real one
+# nor a reason to fail, so the fake persists for this file's lifetime.
+# Files that need their own version (test_regression, test_omemo) install it
+# at their own collection time, overwriting these.
 restore_sys_modules(_MODULES_SNAPSHOT)
+sys.modules["tools"] = tools_mod
+sys.modules["tools.clarify_gateway"] = tools_gateway
 
 
 # ------------------------------------------------------------------

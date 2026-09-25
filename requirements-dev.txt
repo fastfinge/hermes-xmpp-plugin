@@ -1,0 +1,10 @@
+# Dev/test dependencies (runtime deps live in requirements.txt).
+# Install with: uv pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8
+pytest-asyncio>=0.25
+
+# Optional runtime deps, required for the full test suite:
+# - slixmpp-omemo/omemo enable the OMEMO code paths (connect-resilience
+#   readiness tests register xep_0384; without these, those tests fail).
+slixmpp-omemo
+omemo

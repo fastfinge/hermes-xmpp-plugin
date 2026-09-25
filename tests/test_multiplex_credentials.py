@@ -134,9 +134,24 @@ def _reset(monkeypatch, *, multiplex=False, scope=None):
     _STATE["multiplex"] = multiplex
 
 
+_ENV_NAMES = ("XMPP_JID", "XMPP_PASSWORD", "XMPP_ALLOWED_USERS", "HERMES_HOME")
+
+
 @pytest.fixture(autouse=True)
-def _neutral_after_test():
-    """Return the fake secret-scope to its neutral state after every test."""
+def _own_fakes_installed(monkeypatch):
+    """Re-install THIS file's fakes before every test.
+
+    Adapter resolves agent.secret_scope lazily at CALL time, so whichever fake
+    a later-collected file left in sys.modules would otherwise win. Re-binding
+    here makes each file self-sufficient regardless of collection order.
+    """
+    for name in _ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    adapter._DOTENV_PEEK_CACHE.clear()
+    sys.modules["agent"] = _agent
+    sys.modules["agent.secret_scope"] = _secret_scope
+    _STATE["scope"] = None
+    _STATE["multiplex"] = False
     yield
     _STATE["scope"] = None
     _STATE["multiplex"] = False
