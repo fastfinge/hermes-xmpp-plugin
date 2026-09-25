@@ -66,3 +66,10 @@ optional_env:
     description: Per-stanza body length cap in Unicode code-points (default 10000). Long messages are split into multiple stanzas.
     prompt: Max message length
     password: false
+# Installed into the managed venv by `hermes pm install` / `hermes update`.
+# aiohttp is left unpinned so it follows Hermes' own pin (>=3.14.1 for the CVE fixes).
+pip_dependencies:
+  - "slixmpp==1.15.0"
+  - "aiohttp>=3.14.1"
+  - "slixmpp-omemo"
+  - "omemo"
