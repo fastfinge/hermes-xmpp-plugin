@@ -50,3 +50,26 @@ def evict_adapter_modules() -> None:
         root = key.split(".", 1)[0]
         if root in _ADAPTER_PREFIXES:
             del sys.modules[key]
+
+
+def restore_fake_modules(snapshot: dict, fake_roots: tuple[str, ...] = ("adapter", "gateway", "tools")) -> None:
+    """Scoped variant of :func:`restore_sys_modules` for files that keep the
+    real dependency modules (slixmpp, slixmpp_omemo, omemo) real.
+
+    The global restore removes EVERY module first imported since the snapshot
+    — including real dependency submodules that ``import adapter`` pulled in on
+    first import (e.g. ``slixmpp.plugins.base``). Deleting those splits the
+    real module graph across two copies: a later re-import gets a FRESH
+    ``PLUGIN_REGISTRY``, so a plugin registered through the old copy
+    (adapter's ``register_plugin``) is invisible to the new copy
+    (``PluginManager.enable``) — a spurious ``PluginNotFound('xep_0384')`` out
+    of a perfectly good registration. This helper restores/deletes only the
+    faked roots and leaves the real dependency graph intact.
+    """
+    for key in list(sys.modules.keys()):
+        root = key.split(".", 1)[0]
+        if root in fake_roots:
+            if key in snapshot:
+                sys.modules[key] = snapshot[key]
+            else:
+                del sys.modules[key]

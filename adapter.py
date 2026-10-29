@@ -381,6 +381,25 @@ def _has_working_ipv6_route() -> bool:
         return False
 
 
+def _find_omemo_plugin(client: Any) -> Any:
+    """Return the client's registered xep_0384 plugin instance, or None.
+
+    Walks slixmpp's PluginManager registry directly: the public
+    ``client['xep_0384']`` accessor logs warnings and returns False for
+    anything not loaded, and auto-mocks under MagicMock clients. Anything
+    without a real plugin registry — test fakes, mocks, future slixmpp
+    layouts — yields None, which callers treat as "OMEMO was never set up".
+    """
+    try:
+        plugin_manager = getattr(client, "plugin", None)
+        plugins = getattr(plugin_manager, "_plugins", None)
+        if isinstance(plugins, dict):
+            return plugins.get("xep_0384") or None
+    except Exception:
+        pass
+    return None
+
+
 # ----------------------------------------------------------------
 # Adapter
 # ----------------------------------------------------------------
@@ -447,6 +466,14 @@ class XmppAdapter(BasePlatformAdapter):
     # giving up — bounded so an unresponsive server can't hang an unattended
     # cron job on teardown.
     _DISCONNECT_TIMEOUT_SECS = 10.0
+
+    # How long disconnect() waits for each dependency-owned background task
+    # (slixmpp's out-filter pump, OMEMO's session-manager init and signed
+    # pre-key rotation) to actually finish after being cancelled. The stop
+    # signals themselves are plain task.cancel() calls issued before any
+    # await, so this bound only limits the confirmation wait — a wedged task
+    # can delay teardown, never keep it from stopping the rest (issue #12).
+    _TEARDOWN_TIMEOUT_SECS = 5.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
@@ -807,56 +834,234 @@ class XmppAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._closing = True
-        if self.client is not None:
-            # NOTE: an earlier revision also called
-            # self.client.cancel_connection_attempt() here, to abort a
-            # still-in-flight handshake before calling disconnect() (slixmpp's
-            # own disconnect() only cancels the in-flight attempt when
-            # self.transport is already set). That was reverted: it
-            # correlated with connection attempts going completely silent
-            # (no SASL, no bind — nothing) on every subsequent retry in the
-            # same process, consistent with the well-known hazard of
-            # cancelling a task mid-flight through slixmpp's aiodns/pycares
-            # (c-ares) based DNS resolution, which can leave shared resolver
-            # state corrupted for the rest of the process. Raw TCP/STARTTLS
-            # connectivity from the same machine was independently confirmed
-            # fine via `openssl s_client`/`nc`, ruling out network/server
-            # causes. An orphaned handshake finishing late on an already
-            # torn-down adapter is a real but comparatively minor annoyance
-            # (the None-guards elsewhere already make it harmless); silently
-            # wedging every future connection attempt in the process is far
-            # worse, so plain disconnect() without forced cancellation is the
-            # safer default here.
-            try:
-                # slixmpp's disconnect() returns a Future that drains the
-                # send queue before closing the stream — it must be awaited.
-                # The gateway's long-lived loop would eventually run it, but
-                # send_xmpp_message()'s caller closes its loop as soon as we
-                # return, silently dropping any still-queued stanza (send
-                # only enqueues, so success was already reported). Guarded
-                # with isawaitable since older slixmpp returned None here.
-                pending = self.client.disconnect()
-                if inspect.isawaitable(pending):
-                    await asyncio.wait_for(
-                        pending, timeout=self._DISCONNECT_TIMEOUT_SECS
+        # Capture the client once: teardown below must work from this
+        # reference even though self.client is cleared unconditionally.
+        client = self.client
+        try:
+            if client is not None:
+                # NOTE: an earlier revision also called
+                # self.client.cancel_connection_attempt() here, to abort a
+                # still-in-flight handshake before calling disconnect() (slixmpp's
+                # own disconnect() only cancels the in-flight attempt when
+                # self.transport is already set). That was reverted: it
+                # correlated with connection attempts going completely silent
+                # (no SASL, no bind — nothing) on every subsequent retry in the
+                # same process, consistent with the well-known hazard of
+                # cancelling a task mid-flight through slixmpp's aiodns/pycares
+                # (c-ares) based DNS resolution, which can leave shared resolver
+                # state corrupted for the rest of the process. Raw TCP/STARTTLS
+                # connectivity from the same machine was independently confirmed
+                # fine via `openssl s_client`/`nc`, ruling out network/server
+                # causes. An orphaned handshake finishing late on an already
+                # torn-down adapter is a real but comparatively minor annoyance
+                # (the None-guards elsewhere already make it harmless); silently
+                # wedging every future connection attempt in the process is far
+                # worse, so plain disconnect() without forced cancellation is the
+                # safer default here.
+                try:
+                    # slixmpp's disconnect() returns a Future that drains the
+                    # send queue before closing the stream — it must be awaited.
+                    # The gateway's long-lived loop would eventually run it, but
+                    # send_xmpp_message()'s caller closes its loop as soon as we
+                    # return, silently dropping any still-queued stanza (send
+                    # only enqueues, so success was already reported). Guarded
+                    # with isawaitable since older slixmpp returned None here.
+                    pending = client.disconnect()
+                    if inspect.isawaitable(pending):
+                        await asyncio.wait_for(
+                            pending, timeout=self._DISCONNECT_TIMEOUT_SECS
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "xmpp: send-queue flush did not complete within %gs",
+                        self._DISCONNECT_TIMEOUT_SECS,
                     )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "xmpp: send-queue flush did not complete within %gs",
-                    self._DISCONNECT_TIMEOUT_SECS,
+                except Exception:
+                    logger.exception("xmpp: error during disconnect()")
+                finally:
+                    # Whether the flush completed, timed out, or this teardown
+                    # itself was cancelled: the background tasks slixmpp and
+                    # slixmpp-omemo started for this client must still be
+                    # stopped — nothing else will ever stop them (issue #12).
+                    # Runs after the flush because the out-filter pump is what
+                    # drains the send queue.
+                    await self._teardown_dependency_tasks(client)
+            if self._process_task is not None:
+                self._process_task.cancel()
+                self._process_task = None
+            current_task = asyncio.current_task()
+            if self._connect_watchdog_task is not None and self._connect_watchdog_task is not current_task:
+                self._connect_watchdog_task.cancel()
+                self._connect_watchdog_task = None
+        finally:
+            # Unconditional: a disconnect() cut short by cancellation must
+            # not keep the client reference or leave the platform lock held.
+            self.client = None
+            self._release_platform_lock()
+            self._mark_disconnected()
+
+    async def _teardown_dependency_tasks(self, client: Any) -> None:
+        """Stop the background tasks that slixmpp and slixmpp-omemo start
+        for a client and never stop themselves (issue #12).
+
+        Two independent retention paths pin every past client and OMEMO
+        session manager alive across reconnects in a long-running gateway:
+
+        - slixmpp's XMLStream.connect() spawns ``_run_out_filters`` — a
+          ``while True`` pump over the send queue
+          (slixmpp/xmlstream/xmlstream.py). Nothing cancels it on disconnect;
+          the only canceller is XMLStream.__del__, and the pump coroutine's
+          own reference to the stream keeps __del__ from ever running. Every
+          reconnect therefore left one more pump task behind, each pinning
+          its client — together with everything the client accumulated in
+          ``__queued_stanzas`` (stanzas send() parked there whenever the
+          client had no session; slixmpp only drains that buffer on session
+          start). Looking only at adapter.client hides all of this.
+
+        - omemo's SessionManager spawns ``__manage_signed_pre_key_rotation``
+          (a ``while True`` signed-pre-key rotation / bundle re-upload loop)
+          during initialization. It is stopped only by
+          ``SessionManager.shutdown()`` — which slixmpp-omemo's plugin_end()
+          merely *schedules* without awaiting, and plugin_end() itself is
+          never invoked on a plain disconnect.
+
+        Dropping adapter.client touches neither path: the tasks hold their
+        own references to their owners. Teardown therefore (1) cancel()s
+        every owned task first — plain synchronous calls, so all stop
+        signals are issued even if a later await is cut short by our own
+        cancellation — (2) invokes the dependency shutdown API
+        (SessionManager.shutdown()) and awaits each task's termination
+        within _TEARDOWN_TIMEOUT_SECS, and (3) frees the dead client's
+        queued-stanza buffer.
+
+        Everything is attribute-based and defensive: fake clients in tests,
+        partially initialized managers (the legacy oldmemo-only fallback has
+        neither the rotation task nor the async-framework state shutdown()
+        reads), and future slixmpp layout changes all degrade to "nothing to
+        stop" — never to a crash, and never to touching tasks belonging to
+        other adapters or the gateway itself.
+        """
+        try:
+            plugin = _find_omemo_plugin(client)
+            manager = (
+                getattr(plugin, "_XEP_0384__session_manager", None)
+                if plugin is not None
+                else None
+            )
+            init_task = (
+                getattr(plugin, "_XEP_0384__session_manager_task", None)
+                if plugin is not None
+                else None
+            )
+            rotation_task = (
+                getattr(manager, "_SessionManager__signed_pre_key_management_task", None)
+                if manager is not None
+                else None
+            )
+            pump_task = getattr(client, "_run_out_filters", None)
+            slow_tasks = getattr(client, "_XMLStream__slow_tasks", None)
+
+            # (1) Stop signals first — synchronous, unconditional.
+            for task in (init_task, rotation_task, pump_task):
+                self._cancel_task(task)
+            if isinstance(slow_tasks, list):
+                for task in slow_tasks:
+                    self._cancel_task(task)
+
+            # The adapter is done with this client: drop the plugin's cached
+            # manager refs up front so no late get_session_manager() caller
+            # latches onto a manager that is already being shut down.
+            if plugin is not None:
+                for attr in (
+                    "_XEP_0384__session_manager",
+                    "_XEP_0384__session_manager_task",
+                ):
+                    try:
+                        setattr(plugin, attr, None)
+                    except Exception:
+                        pass
+
+            # (2) Dependency shutdown API + bounded confirmation.
+            await self._shutdown_omemo_manager(manager)
+            await self._reap_task(rotation_task, "OMEMO signed pre-key rotation task")
+            await self._reap_task(init_task, "OMEMO session-manager init task")
+            await self._reap_task(pump_task, "slixmpp out-filter pump task")
+            if isinstance(slow_tasks, list):
+                for task in slow_tasks:
+                    await self._reap_task(task, "slixmpp slow out-filter task")
+
+            # (3) Free stanzas the discarded client can never send. These
+            # accumulate while a client has no session (failed reconnect
+            # cycles, one-shot sends racing their own teardown) and are held
+            # against the client for as long as anything references it.
+            queued = getattr(client, "_XMLStream__queued_stanzas", None)
+            if isinstance(queued, list) and queued:
+                logger.debug(
+                    "xmpp: dropping %d undeliverable queued stanza(s) of discarded client",
+                    len(queued),
                 )
-            except Exception:
-                logger.exception("xmpp: error during disconnect()")
-        if self._process_task is not None:
-            self._process_task.cancel()
-            self._process_task = None
-        current_task = asyncio.current_task()
-        if self._connect_watchdog_task is not None and self._connect_watchdog_task is not current_task:
-            self._connect_watchdog_task.cancel()
-            self._connect_watchdog_task = None
-        self.client = None
-        self._release_platform_lock()
-        self._mark_disconnected()
+                queued.clear()
+        except Exception:
+            # Teardown must never break disconnect() itself.
+            logger.exception("xmpp: error while tearing down client background tasks")
+
+    async def _shutdown_omemo_manager(self, manager: Any) -> None:
+        """Invoke the OMEMO library's own SessionManager.shutdown() — the
+        lifecycle method that cancels and awaits the signed pre-key rotation
+        task — bounded so a wedged manager cannot hang teardown.
+
+        Partially initialized managers (the legacy oldmemo-only fallback,
+        which has neither the rotation task nor the async-framework state
+        shutdown() reads) raise AttributeError there; there is nothing to
+        stop for those and the quiet outcome is expected.
+        """
+        if manager is None:
+            return
+        shutdown = getattr(manager, "shutdown", None)
+        if shutdown is None:
+            return
+        try:
+            result = shutdown()
+            if inspect.isawaitable(result):
+                await asyncio.wait_for(
+                    result, timeout=self._TEARDOWN_TIMEOUT_SECS
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "xmpp: OMEMO session-manager shutdown did not complete within %gs",
+                self._TEARDOWN_TIMEOUT_SECS,
+            )
+        except AttributeError:
+            logger.debug(
+                "xmpp: OMEMO session manager only partially initialized; nothing to shut down"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("xmpp: error shutting down OMEMO session manager")
+
+    async def _reap_task(self, task: Any, what: str) -> None:
+        """Wait (bounded) for a cancelled task to actually finish, so
+        disconnect() only returns once the task is gone — a task that is
+        merely *scheduled* to die could outlive the teardown window and keep
+        its owner alive. asyncio.wait() is deliberate: awaiting the task
+        directly would re-raise its CancelledError here.
+        """
+        if not isinstance(task, asyncio.Future) or task.done():
+            return
+        try:
+            await asyncio.wait((task,), timeout=self._TEARDOWN_TIMEOUT_SECS)
+        except Exception:
+            logger.debug("xmpp: %s did not shut down cleanly", what, exc_info=True)
+
+    @staticmethod
+    def _cancel_task(task: Any) -> None:
+        """cancel() a task/future if that is what it is. The isinstance check
+        is on asyncio.Future (Task subclasses it) rather than duck-typed on
+        cancel(), so MagicMock stand-ins in tests are never touched.
+        """
+        if isinstance(task, asyncio.Future) and not task.done():
+            task.cancel()
 
     async def _run_process(self) -> None:
         """slixmpp's process loop."""

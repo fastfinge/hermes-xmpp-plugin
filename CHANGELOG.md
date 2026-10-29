@@ -139,6 +139,22 @@ All notable changes to this project will be documented in this file.
   `XMPP_DISABLE_CLARIFY_FORMS=true` (env) or `disable_clarify_forms: true`
   (config.yaml) to force the numbered text fallback path even when the
   `xep_0004` plugin is registered.
+- **`disconnect()` now shuts down dependency-owned background tasks**
+  (issue #12): Slixmpp's `run_filters` out-filter pump and the OMEMO
+  session manager's signed-pre-key rotation task are started by
+  `XMLStream.connect()` / `SessionManager.initialize()` and stopped by
+  nothing on the old teardown path — every reconnect cycle leaked one
+  client and one session manager apiece in long-running gateways (207 of
+  each and 361k queued stanzas observed in one report). Teardown now
+  cancels and awaits both tasks with a bounded `_TEARDOWN_TIMEOUT_SECS`
+  (5s default), invokes `SessionManager.shutdown()`, nulls the session
+  manager cached under the `xep_0384` plugin so it isn't recreated from a
+  stale cache, and drains `XMLStream.__queued_stanzas` and the slow
+  out-filter tasks owned by the old client. Covers timeout, partially
+  initialized, and already-torn-down paths. Late `_session_bind`
+  reflections belonging to an already-torn-down identifier are now
+  ignored. The documented refusal to blanket-cancel an in-flight
+  connection attempt (see Notes) is unchanged.
 
 ## [0.3.0] — First-class XMPP
 

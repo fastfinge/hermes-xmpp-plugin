@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _mock_gateway():
     """Inject gateway / tools stubs so adapter.py can import without the full framework."""
+    # Evict anything a previously-imported test file left cached, so adapter
+    # always re-executes against the fakes installed below (order-independence).
+    for key in list(sys.modules.keys()):
+        if key == "adapter" or key.startswith("adapter.") or key.startswith("gateway") \
+                or key == "tools" or key.startswith("tools."):
+            del sys.modules[key]
     gateway_mod = unittest.mock.MagicMock()
     sys.modules["gateway"] = gateway_mod
     gw_config = unittest.mock.MagicMock()
