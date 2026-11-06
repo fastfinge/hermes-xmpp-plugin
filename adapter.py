@@ -555,8 +555,12 @@ class XmppAdapter(BasePlatformAdapter):
         # Allow-list
         allow_all_raw = str(extra.get("allow_all_users", _scoped_getenv("XMPP_ALLOW_ALL_USERS", "")))
         self.allow_all_users: bool = allow_all_raw.strip().lower() in ("1", "true", "yes")
-        allowed_env = str(extra.get("allowed_users") or _scoped_getenv("XMPP_ALLOWED_USERS", "")).strip()
-        self.allowed_users = {j.strip() for j in allowed_env.split(",") if j.strip()}
+        allowed_env = _csv(extra.get("allowed_users") or _scoped_getenv("XMPP_ALLOWED_USERS", ""))
+        self.allowed_users = {self._bare(j.strip()) for j in allowed_env.split(",") if j.strip()}
+        muc_allowed = extra.get("muc_allowed_users")
+        if muc_allowed is None:
+            muc_allowed = _scoped_getenv("XMPP_MUC_ALLOWED_USERS", allowed_env)
+        self.muc_allowed_users = {self._bare(j.strip()) for j in _csv(muc_allowed).split(",") if j.strip()}
 
         # OMEMO
         omemo_cfg = extra.get("omemo", {})
@@ -613,6 +617,26 @@ class XmppAdapter(BasePlatformAdapter):
         self._clarify_forms_disabled: bool = (
             str(extra.get("disable_clarify_forms", os.getenv("XMPP_DISABLE_CLARIFY_FORMS", "")))
             .strip().lower() in ("1", "true", "yes")
+        )
+
+        # Inbound voice notes: a message whose only content is one audio
+        # attachment (XEP-0066 OOB, XEP-0447 SFS, or an OMEMO aesgcm:// link)
+        # is cached locally and handed to Hermes as a VOICE event, so core
+        # transcribes it with the configured ``stt`` provider. On by default;
+        # set ``voice_transcription: false`` / XMPP_VOICE_TRANSCRIPTION=false
+        # to get the old behaviour (ordinary HTTPS URLs arrive as plain text).
+        self._voice_transcription_enabled: bool = _truthy(
+            extra.get("voice_transcription", _scoped_getenv("XMPP_VOICE_TRANSCRIPTION", "true"))
+        )
+        # Upload hosts allowed to resolve to private / LAN / tailnet
+        # (100.64.0.0/10) addresses when fetching voice notes. Hermes' SSRF
+        # policy blocks those ranges, which would break every voice note on
+        # a self-hosted server reachable only over LAN or Tailscale. Default:
+        # the bot's own XMPP domain and its subdomains (upload.<domain>, …).
+        # Everything else still goes through Hermes' full SSRF checks.
+        self._voice_trusted_hosts: tuple = _parse_trusted_hosts(
+            extra.get("voice_trusted_hosts", _scoped_getenv("XMPP_VOICE_TRUSTED_HOSTS", None)),
+            self.jid,
         )
 
     # -----------------------------------------------------------------
@@ -1253,6 +1277,19 @@ class XmppAdapter(BasePlatformAdapter):
                 except (AttributeError, TypeError):
                     pass
 
+            # Authorize before decryption, forms, downloads, or gateway dispatch.
+            if stanza_type == "groupchat":
+                chat_type, chat_id = "group", from_bare
+                user_name = from_resource or None
+                user_id = self._muc_real_jid(stanza) or ""
+            else:
+                chat_type, chat_id = "dm", from_bare
+                user_name, user_id = None, from_bare
+            if not self._is_authorized(chat_type=chat_type, chat_id=chat_id, user_jid=user_id):
+                return
+            if chat_type == "dm":
+                self._known_dms.add(from_bare)
+
             body = stanza["body"] or ""
             stanza_to_dispatch = stanza
 
@@ -1313,28 +1350,21 @@ class XmppAdapter(BasePlatformAdapter):
                     # Fall through: form submission could not be resolved,
                     # treat as normal message if there's a body.
 
-            if not body:
-                return
+            # ----------------------------------------------------------------
+            # Inbound voice note / single audio attachment → Hermes STT
+            # ----------------------------------------------------------------
+            # Detected BEFORE the empty-body guard (an SFS-only voice note may
+            # carry no body at all) but only downloaded AFTER authorization
+            # above, so unknown senders can never make us fetch a URL.
+            voice: Optional[_VoiceAttachment] = None
+            if self._voice_transcription_enabled:
+                try:
+                    voice = _extract_voice_attachment(stanza_to_dispatch, body)
+                except Exception:
+                    logger.debug("xmpp: voice attachment detection failed")
+                    voice = None
 
-            if stanza_type == "groupchat":
-                chat_type = "group"
-                chat_id = from_bare
-                user_name = from_resource or None
-                user_id = self._muc_real_jid(stanza) or chat_id
-            else:
-                chat_type = "dm"
-                chat_id = from_bare
-                user_name = None
-                user_id = from_bare
-                # Remember this is a real 1:1 peer so we never reply to it as a
-                # group, regardless of the domain's prefix (see _known_dms).
-                self._known_dms.add(from_bare)
-
-            if not self._is_authorized(chat_type=chat_type, chat_id=chat_id, user_jid=user_id):
-                logger.debug(
-                    "xmpp: dropping unauthorized %s from %s in %s",
-                    chat_type, user_id, chat_id,
-                )
+            if not body and voice is None:
                 return
 
             source = self.build_source(
@@ -1342,6 +1372,7 @@ class XmppAdapter(BasePlatformAdapter):
                 chat_type=chat_type,
                 user_id=user_id,
                 user_name=user_name,
+                role_authorized=chat_type == "group",
             )
             # Extract reply context for XEP-0461
             reply_to_message_id = None
@@ -1364,6 +1395,43 @@ class XmppAdapter(BasePlatformAdapter):
                             reply_to_text = raw_body
                 except Exception:
                     pass
+
+            # Reply fallback text can contain attachment keys, even after stripping.
+            if reply_to_text and "aesgcm://" in body.lower():
+                reply_to_text = None
+
+            if voice is not None:
+                audio_path = await self._cache_voice_attachment(voice, from_bare)
+                if audio_path:
+                    # Empty text + VOICE + an audio/* media type is exactly
+                    # what Hermes core's STT pipeline keys on: the gateway
+                    # transcribes the file with the operator's configured
+                    # ``stt`` provider (local or remote) and uses the
+                    # transcript as the user prompt. VOICE (not AUDIO) is
+                    # deliberate — core treats AUDIO as a file attachment
+                    # and never transcribes it.
+                    voice_event = MessageEvent(
+                        text="",
+                        message_type=_voice_message_type(),
+                        source=source,
+                        raw_message=stanza_to_dispatch,
+                        message_id=stanza.get("id") or None,
+                        reply_to_message_id=reply_to_message_id,
+                        reply_to_text=reply_to_text,
+                    )
+                    voice_event.media_urls = [audio_path]
+                    voice_event.media_types = [voice.mime]
+                    await self.handle_message(voice_event)
+                    return
+                if not body:
+                    return
+                # Encrypted URLs carry keys. Never send failed attachments to the LLM.
+                if voice.encrypted:
+                    return
+
+            # Also cover disabled STT, captions, and unrecognized encrypted files.
+            if "aesgcm://" in body.lower():
+                return
             event = MessageEvent(
                 text=body,
                 message_type=MessageType.TEXT,
@@ -1376,6 +1444,53 @@ class XmppAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         except Exception:
             logger.exception("xmpp: error handling inbound stanza")
+
+    async def _cache_voice_attachment(self, voice: "_VoiceAttachment", sender: str) -> Optional[str]:
+        """Download *voice* into Hermes' audio cache; return the local path or None.
+
+        Hosts in ``voice_trusted_hosts`` (default: our own XMPP domain) may
+        resolve to LAN/tailnet addresses; every other host gets Hermes'
+        full SSRF checks. Either way the ``gateway.max_inbound_media_bytes``
+        cap, the cloud-metadata floor and core's container sniffing apply.
+        Never raises: on failure the caller falls back to plain text.
+        """
+        from urllib.parse import urlsplit
+
+        try:
+            fetch_url, iv, key = voice.url, b"", b""
+            if voice.encrypted:
+                fetch_url, iv, key = _parse_aesgcm_url(voice.url)
+            host = (urlsplit(fetch_url).hostname or "").lower()
+            trusted = _host_is_trusted(host, self._voice_trusted_hosts)
+            try:
+                data = await _fetch_voice_bytes(fetch_url, trusted=trusted)
+            except _UntrustedHostBlocked:
+                logger.warning(
+                    "xmpp: voice note from %s not fetched: Hermes' URL-safety policy refused "
+                    "upload host %r (private, LAN or tailnet address?). If it is your own "
+                    "upload service, add it to voice_trusted_hosts / XMPP_VOICE_TRUSTED_HOSTS.",
+                    sender, host,
+                )
+                return None
+            if voice.encrypted:
+                data = _aesgcm_decrypt(data, iv, key)
+            path = await _cache_audio_bytes(data, voice.ext)
+            logger.info(
+                "xmpp: voice note from %s cached for STT (%d bytes, %s%s%s)",
+                sender, len(data), voice.mime,
+                ", OMEMO" if voice.encrypted else "",
+                ", trusted host" if trusted else "",
+            )
+            return path
+        except ImportError as exc:
+            logger.warning(
+                "xmpp: voice helper unavailable (%s)", type(exc).__name__,
+            )
+        except Exception as exc:
+            logger.warning(
+                "xmpp: could not fetch voice note (%s)", type(exc).__name__,
+            )
+        return None
 
     def _handle_form_submission(
         self,
@@ -1441,13 +1556,19 @@ class XmppAdapter(BasePlatformAdapter):
             return False
 
     def _muc_real_jid(self, stanza: Any) -> Optional[str]:
+        # XEP-0045 presence cache is maintained by slixmpp from room presence.
+        # Never trust a message's <muc><item jid=...> or nickname as identity.
         try:
-            muc = stanza.get("muc")
-            if muc and getattr(muc, "jid", None):
-                return self._bare(str(muc["jid"]))
+            sender = stanza.get_from()
+            if self.client is None or "xep_0045" not in self._registered_plugins:
+                return None
+            jid = self.client["xep_0045"].get_jid_property(JID(sender.bare), sender.resource, "jid")
+            if not isinstance(jid, (str, JID)) or not jid:
+                return None
+            real = JID(str(jid))
+            return real.bare if real.user and real.domain else None
         except Exception:
-            pass
-        return None
+            return None
 
     def _muc_room_nick(self, room_bare: str) -> Optional[str]:
         """Return the nick we joined a given MUC room under.
@@ -1461,13 +1582,12 @@ class XmppAdapter(BasePlatformAdapter):
         return self.muc_nick
 
     def _is_authorized(self, *, chat_type: str, chat_id: str, user_jid: str) -> bool:
+        if chat_type == "group":
+            return (chat_id in self._known_mucs and bool(user_jid)
+                    and self._bare(user_jid) in self.muc_allowed_users)
         if self.allow_all_users:
             return True
-        if chat_type == "group":
-            return chat_id in self._known_mucs
-        if not self.allowed_users:
-            return False
-        return self._bare(user_jid) in self.allowed_users
+        return bool(user_jid) and self._bare(user_jid) in self.allowed_users
 
     # -----------------------------------------------------------------
     # Outbound
@@ -2203,8 +2323,14 @@ class XmppAdapter(BasePlatformAdapter):
                 disposition="inline",
             )
             msg = self.client.make_message(mto=chat_id, mtype=mtype)
-            msg["body"] = "[Voice message]"
-            msg["sfs"] = sfs
+            # Append the stanza: assigning msg["sfs"] creates an empty plugin.
+            msg.append(sfs)
+            msg["body"] = url
+            msg["oob"]["url"] = url
+            from slixmpp.xmlstream import ET
+            fallback = ET.Element("{urn:xmpp:fallback:0}fallback", {"for": "urn:xmpp:sfs:0"})
+            ET.SubElement(fallback, "{urn:xmpp:fallback:0}body")
+            msg.append(fallback)
             msg.send()
 
             msg_id = None
@@ -2312,6 +2438,290 @@ async def send_xmpp_message(
 
 
 # ---------------------------------------------------------------------
+# Inbound voice notes (single audio attachment → Hermes STT)
+# ---------------------------------------------------------------------
+
+_OOB_NS = "jabber:x:oob"
+_SFS_NS = "urn:xmpp:sfs:0"
+_FILE_META_NS = "urn:xmpp:file:metadata:0"
+_URL_DATA_NS = "http://jabber.org/protocol/url-data"
+
+# Extension → MIME for the formats XMPP clients record voice notes in
+# (Conversations: .m4a/.oga/.opus, Dino/Gajim/Monal: .ogg/.opus/.m4a/.aac).
+# Hermes core re-sniffs the real container before STT, so this map only has
+# to decide "is this audio?" and give core a sensible starting extension.
+_VOICE_EXT_MIME: Dict[str, str] = {
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".weba": "audio/webm",
+    ".amr": "audio/amr",
+}
+_MIME_VOICE_EXT: Dict[str, str] = {
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/mpeg": ".mp3",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/flac": ".flac",
+    "audio/webm": ".weba", "audio/amr": ".amr",
+}
+
+
+@dataclass(frozen=True)
+class _VoiceAttachment:
+    url: str         # https:// (plain) or aesgcm:// (XEP-0454, OMEMO)
+    mime: str        # audio/* — fed to MessageEvent.media_types
+    ext: str         # starting extension for the cache file
+    encrypted: bool  # True for aesgcm:// links
+
+
+def _voice_message_type() -> Any:
+    """MessageType.VOICE, tolerating an enum/fake that lacks it."""
+    return getattr(MessageType, "VOICE", "voice")
+
+
+def _url_path_ext(url: str) -> str:
+    from urllib.parse import urlsplit, unquote
+    return Path(unquote(urlsplit(url).path)).suffix.lower()
+
+
+def _classify_audio(url: str, declared_mime: str = "") -> Optional[_VoiceAttachment]:
+    """Return a _VoiceAttachment if *url* points at audio, else None."""
+    url = (url or "").strip()
+    scheme = url.split(":", 1)[0].lower() if ":" in url else ""
+    if scheme not in ("https", "aesgcm"):
+        return None  # plain http and odd schemes are never auto-fetched
+    ext = _url_path_ext(url)
+    mime = (declared_mime or "").split(";", 1)[0].strip().lower()
+    if mime.startswith("audio/"):
+        ext = ext if ext in _VOICE_EXT_MIME else _MIME_VOICE_EXT.get(mime, ".ogg")
+    elif mime:
+        return None  # sender declared a non-audio type; trust it
+    elif ext in _VOICE_EXT_MIME:
+        mime = _VOICE_EXT_MIME[ext]
+    else:
+        return None
+    return _VoiceAttachment(url=url, mime=mime, ext=ext, encrypted=(scheme == "aesgcm"))
+
+
+def _extract_voice_attachment(stanza: Any, body: str) -> Optional[_VoiceAttachment]:
+    """Detect a message that is exactly ONE audio attachment and no text.
+
+    Recognised carriers:
+      * XEP-0066 OOB ``<x xmlns='jabber:x:oob'><url>`` (Conversations, Dino,
+        Gajim, Monal for unencrypted uploads);
+      * XEP-0447 SFS ``<file-sharing>`` with an ``audio/*`` media-type;
+      * an OMEMO-decrypted body that is a single ``aesgcm://`` link
+        (XEP-0454 — encrypted payloads carry no OOB element).
+
+    "No text" means the body is empty or is just the attachment URL (the
+    fallback body clients put next to OOB/SFS). A captioned file, several
+    attachments, or a non-audio attachment returns None so the message
+    takes the normal text path unchanged.
+    """
+    body_s = (body or "").strip()
+    xml = getattr(stanza, "xml", None)
+
+    # Every attachment URL the stanza carries, with any declared MIME type.
+    # Read straight from the XML: ``stanza["oob"]`` would *create* an empty
+    # <x/> as a side effect on messages that have none.
+    found: List[tuple] = []
+    if xml is not None:
+        for x in xml.findall(f"{{{_OOB_NS}}}x"):
+            u = x.find(f"{{{_OOB_NS}}}url")
+            if u is not None and (u.text or "").strip():
+                found.append((u.text.strip(), ""))
+        for fs in xml.findall(f"{{{_SFS_NS}}}file-sharing"):
+            mt = fs.find(f"{{{_FILE_META_NS}}}file/{{{_FILE_META_NS}}}media-type")
+            declared = (mt.text or "").strip() if mt is not None else ""
+            for ud in fs.findall(f"{{{_SFS_NS}}}sources/{{{_URL_DATA_NS}}}url-data"):
+                target = (ud.get("target") or "").strip()
+                if target:
+                    found.append((target, declared))
+    if not found and body_s.lower().startswith("aesgcm://") and not any(c.isspace() for c in body_s):
+        found.append((body_s, ""))
+
+    # Collapse duplicates (OOB + SFS often advertise the same URL), keeping
+    # the most specific declared type.
+    by_url: Dict[str, str] = {}
+    for url, declared in found:
+        by_url[url] = by_url.get(url) or declared
+    if len(by_url) != 1:
+        return None
+
+    url, declared = next(iter(by_url.items()))
+    if body_s and body_s != url:
+        return None  # has a caption / real text → not a bare voice note
+    return _classify_audio(url, declared)
+
+
+def _parse_aesgcm_url(url: str) -> tuple:
+    """Split an XEP-0454 ``aesgcm://`` URL → (https_url, iv, key).
+
+    The fragment is hex: a 12- or 16-byte IV followed by a 32-byte key.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    frag = parts.fragment
+    if len(frag) not in (88, 96):
+        raise ValueError("aesgcm link has an unexpected key fragment length")
+    raw = bytes.fromhex(frag)
+    iv, key = raw[:-32], raw[-32:]
+    https_url = urlunsplit(("https", parts.netloc, parts.path, parts.query, ""))
+    return https_url, iv, key
+
+
+class _UntrustedHostBlocked(ValueError):
+    """Hermes' SSRF policy refused an upload host not in voice_trusted_hosts."""
+
+
+def _parse_trusted_hosts(raw: Any, jid: str) -> tuple:
+    """Normalise ``voice_trusted_hosts`` → tuple of lower-case host patterns.
+
+    ``None`` (unset)        → the bot's JID domain and ``*.<domain>``
+    ``"none"``/``"off"``/…  → () — no exceptions to Hermes' SSRF policy
+    list or comma string    → exactly those entries; ``*.example.org``
+                              matches subdomains only, IP literals match
+                              exactly (IPv6 with or without brackets)
+    """
+    if raw is None:
+        domain = (jid or "").split("@")[-1].split("/")[0].strip().lower().rstrip(".")
+        return (domain, f"*.{domain}") if domain else ()
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        text = str(raw).strip()
+        if text.lower() in ("", "none", "off", "false", "0", "no"):
+            return ()
+        items = text.split(",")
+    out = []
+    for item in items:
+        h = item.strip().lower().rstrip(".")
+        if h.startswith("[") and h.endswith("]"):
+            h = h[1:-1]
+        if h and h not in out:
+            out.append(h)
+    return tuple(out)
+
+
+def _host_is_trusted(host: str, patterns: tuple) -> bool:
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    for pat in patterns:
+        if pat.startswith("*."):
+            if host.endswith(pat[1:]) and len(host) > len(pat) - 1:
+                return True
+        elif host == pat:
+            return True
+    return False
+
+
+def _open_direct_client(**kwargs: Any) -> Any:
+    """Hermes' pinned-IP transport with private resolution allowed only here.
+
+    ponytail: private core backend API; fail closed if unsupported, never use
+    plain httpx as fallback. Replace with public per-client policy when available.
+    """
+    import socket
+    from tools.url_safety import (
+        create_ssrf_safe_async_client, _SSRFGuardedAsyncNetworkBackend,
+        _iter_resolved_ips, _is_always_blocked_ip, SSRFConnectionBlocked,
+    )
+
+    class _TrustedBackend(_SSRFGuardedAsyncNetworkBackend):
+        def _connect_ips(self, host: str, port: int) -> list[str]:
+            answers = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            ips = []
+            for _, text, ip in _iter_resolved_ips(answers):
+                if ip is None or _is_always_blocked_ip(ip):
+                    raise SSRFConnectionBlocked("refusing invalid or cloud-metadata address")
+                if text not in ips:
+                    ips.append(text)
+            if not ips:
+                raise SSRFConnectionBlocked("upload DNS returned no addresses")
+            return ips
+
+    # Proxies would resolve remotely and bypass our connection-time floor.
+    client = create_ssrf_safe_async_client(trust_env=False, **kwargs)
+    pool = client._transport._pool
+    backend = pool._network_backend
+    pool._network_backend = _TrustedBackend(backend._schemes_by_origin_var)
+    return client
+
+
+async def _fetch_voice_bytes(url: str, *, trusted: bool) -> bytes:
+    """GET an https:// voice-note URL under Hermes' inbound media cap.
+
+    Untrusted hosts: Hermes' own SSRF-safe client — pre-flight
+    ``is_safe_url``, connect-time IP validation, re-checked redirects.
+    Trusted hosts (our own upload service, possibly on a LAN/tailnet
+    address): pinned-IP Hermes backend with a private-address exception;
+    redirects refused, cloud-metadata floor enforced at connection time.
+    """
+    from tools.url_safety import (  # pyright: ignore[reportMissingImports]
+        create_ssrf_safe_async_client,
+        is_always_blocked_url,
+        is_safe_url,
+    )
+    from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
+        get_inbound_media_max_bytes,
+        validate_inbound_media_size,
+    )
+    if trusted:
+        client_cm = _open_direct_client(timeout=60.0, follow_redirects=False)
+    else:
+        client_cm = create_ssrf_safe_async_client(
+            timeout=60.0, follow_redirects=False, trust_env=False,
+        )
+    from urllib.parse import urljoin, urlsplit
+
+    max_bytes = get_inbound_media_max_bytes()
+    async with client_cm as client:
+        for _ in range(client.max_redirects + 1):
+            if urlsplit(url).scheme.lower() != "https":
+                raise ValueError("voice attachments require HTTPS")
+            if await asyncio.to_thread(is_always_blocked_url, url):
+                raise ValueError("refusing cloud-metadata address")
+            if not trusted and not await asyncio.to_thread(is_safe_url, url):
+                raise _UntrustedHostBlocked("upload host refused by Hermes URL-safety policy")
+            async with client.stream("GET", url) as resp:
+                if trusted and 300 <= resp.status_code < 400:
+                    raise ValueError("trusted upload host redirected; not following")
+                if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+                    # Closing the stream discards redirect bodies without buffering them.
+                    url = urljoin(url, resp.headers["location"])
+                    continue
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length")
+                if declared and str(declared).isdigit():
+                    validate_inbound_media_size(int(declared), media_type="audio", max_bytes=max_bytes)
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    validate_inbound_media_size(total, media_type="audio", max_bytes=max_bytes)
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    raise ValueError("too many voice attachment redirects")
+
+
+def _aesgcm_decrypt(data: bytes, iv: bytes, key: bytes) -> bytes:
+    """XEP-0454: ciphertext carries the 16-byte GCM tag; decrypt() verifies it."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
+    return AESGCM(key).decrypt(iv, data, None)
+
+
+async def _cache_audio_bytes(data: bytes, ext: str) -> str:
+    """Write decrypted voice-note bytes into Hermes core's audio cache."""
+    from gateway.platforms.base import cache_audio_from_bytes_async  # pyright: ignore[reportMissingImports]
+    return await cache_audio_from_bytes_async(data, ext)
+
+
+# ---------------------------------------------------------------------
 # Registration helpers
 # ---------------------------------------------------------------------
 
@@ -2416,7 +2826,7 @@ def _multiplex_active() -> bool:
         return False
 
 
-def _scoped_getenv(name: str, default: str = "", *, peek: bool = False) -> str:
+def _scoped_getenv(name: str, default: Any = "", *, peek: bool = False) -> Any:
     """``os.getenv`` honouring the active profile's secret scope.
 
     Resolution order: ``agent.secret_scope.get_secret`` (the per-profile
@@ -2480,6 +2890,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         ("XMPP_MUC_ROOMS", "muc_rooms"),
         ("XMPP_MUC_NICK", "muc_nick"),
         ("XMPP_ALLOWED_USERS", "allowed_users"),
+        ("XMPP_MUC_ALLOWED_USERS", "muc_allowed_users"),
         ("XMPP_ALLOW_ALL_USERS", "allow_all_users"),
     ):
         value = _scoped_getenv(env).strip()
@@ -2493,7 +2904,8 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     extra = dict(raw.get("extra") or {})
     for key in (
         "jid", "password", "host", "port", "direct_tls", "connect_timeout_secs",
-        "muc_rooms", "muc_nick", "allowed_users", "allow_all_users", "max_message_length",
+        "muc_rooms", "muc_nick", "allowed_users", "muc_allowed_users", "allow_all_users", "max_message_length",
+        "voice_transcription", "voice_trusted_hosts",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]
@@ -2521,6 +2933,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         "muc_rooms": "XMPP_MUC_ROOMS",
         "muc_nick": "XMPP_MUC_NICK",
         "allowed_users": "XMPP_ALLOWED_USERS",
+        "muc_allowed_users": "XMPP_MUC_ALLOWED_USERS",
         "allow_all_users": "XMPP_ALLOW_ALL_USERS",
         "home_channel": "XMPP_HOME_CHANNEL",
     }

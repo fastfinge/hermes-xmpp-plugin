@@ -341,7 +341,7 @@ class TestFileHelpers:
         sfs_mock = MagicMock()
         adapter_instance.client["xep_0447"].get_sfs.return_value = sfs_mock
         msg_mock = MagicMock()
-        msg_mock.__getitem__ = lambda s, k: "id2"
+        msg_mock.__getitem__ = lambda s, k: "id2" if k == "id" else MagicMock()
         adapter_instance.client.make_message.return_value = msg_mock
 
         captured = {}

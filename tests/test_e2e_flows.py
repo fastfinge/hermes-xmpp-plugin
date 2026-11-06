@@ -290,6 +290,9 @@ async def test_inbound_chat_message_creates_event(adapter_instance):
 
 @pytest.mark.asyncio
 async def test_inbound_groupchat_message_creates_event(adapter_instance):
+    adapter_instance._known_mucs = {"room@conference.example.org"}
+    adapter_instance.muc_allowed_users = {"real@example.org"}
+    adapter_instance._muc_real_jid = lambda _: "real@example.org"
     stanza = _make_stanza(
         type="groupchat",
         body="room hello",

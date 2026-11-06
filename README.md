@@ -2,6 +2,10 @@
 
 Third-party XMPP/Jabber gateway platform plugin for Hermes Agent.
 
+See [voice messages](docs/voice-messages.md) for audio transport and STT,
+and [MUC sender authorization](docs/muc-authorization.md) for room permissions
+and migration from room-only authorization.
+
 This packages the work from the upstream Hermes Agent XMPP PRs as an optional
 user plugin so self-hosters can use XMPP now instead of waiting for the core PR
 to land. It supports:
@@ -35,6 +39,10 @@ because the packager wants credit for other people's work. Tiny open-source gobl
 energy, responsibly attributed.
 
 ## Install
+
+For managed Hermes installations, use supported plugin/package management;
+do not run direct pip/uv commands against the managed runtime. Preserve the
+existing enabled-plugin list.
 
 From the Hermes profile you want to use:
 
@@ -73,9 +81,10 @@ XMPP_MUC_NICK=hermes
 XMPP_HOME_CHANNEL=sam@example.org
 ```
 
-`XMPP_ALLOWED_USERS` uses bare JIDs. MUC access is gated by room membership: if
-the bot joins a room listed in `XMPP_MUC_ROOMS`, messages in that room are accepted.
-For quick local testing only, set `XMPP_ALLOW_ALL_USERS=true`.
+`XMPP_ALLOWED_USERS` uses personal bare JIDs. MUC requires both a configured
+room and verified personal sender in `muc_allowed_users` (defaults to
+`allowed_users`). Unknown identities are denied. `XMPP_ALLOW_ALL_USERS=true`
+bypasses DM checks only; it never bypasses MUC authorization.
 
 ## Configure with config.yaml
 
@@ -92,8 +101,7 @@ xmpp:
   password: ${XMPP_PASSWORD}
   allowed_users:
     - sam@example.org
-  muc_rooms:
-    - room@conference.example.org/hermes
+  muc_rooms: "room@conference.example.org/hermes"
   home_channel: sam@example.org
 ```
 
@@ -237,10 +245,41 @@ path even when the `xep_0004` plugin is registered.
 
 Voice messages from Hermes are sent as XEP-0447 Stateless File Sharing (SFS)
 messages. The file is uploaded via XEP-0363 HTTP upload first, then a lightweight
-SFS reference is sent. This allows clients to preview metadata before downloading.
+SFS reference is sent. The same upload URL is included in the body and XEP-0066
+OOB fallback, with a whole-body XEP-0428 marker. Clients can preview metadata or
+use the compatible download reference. The SFS metadata and file hash are kept.
 
 Voice calls (Jingle) are not yet supported because slixmpp does not include a
 Jingle RTP implementation.
+
+### Inbound voice notes → speech-to-text
+
+Send exactly one audio attachment without a caption. The plugin accepts OOB,
+SFS, and decrypted XEP-0454 links, caches the audio, and passes a `VOICE` event
+to Hermes core. Your configured STT provider handles transcription; no provider
+endpoint or local audio engine is required by this plugin.
+
+Authorization happens before downloads. MUC requires both a configured room
+and a verified personal sender in `muc_allowed_users` (defaults to
+`allowed_users`). Room membership alone is no longer sufficient. See
+[MUC sender authorization and migration](docs/muc-authorization.md).
+
+Private upload services can use a hostname-scoped exception to Hermes' SSRF
+policy. The default trusts the bot's JID domain and subdomains; prefer an exact
+upload hostname, or set `"none"` for no private-address exceptions:
+
+```yaml
+xmpp:
+  voice_trusted_hosts: ["upload.example.org"]
+  # voice_transcription: false  # Disable automatic incoming voice processing.
+```
+
+The corresponding environment settings are `XMPP_VOICE_TRUSTED_HOSTS` and
+`XMPP_VOICE_TRANSCRIPTION`. HTTPS, valid TLS, size limits, and the metadata-address
+block remain enforced. Trusted downloads reject redirects and environment
+proxies. Encrypted key-bearing URLs are never forwarded as agent text, even
+when transcription is disabled or a download fails. See
+[voice transport and security details](docs/voice-messages.md).
 
 ### Ad-hoc commands (XEP-0050)
 
@@ -250,15 +289,21 @@ basic command list is exposed; future releases may add Hermes-specific commands.
 
 ## Development
 
-The test suite runs standalone — no Hermes checkout required. It uses mocks for the
-Hermes gateway and slixmpp internals.
+Use an isolated test environment with `requirements.txt` and
+`requirements-dev.txt`; do not modify the managed Hermes environment. Gateway
+imports are mocked, while voice tests use real Slixmpp XML and cryptography.
 
 ```bash
-python -m pytest -q
+python -m pytest tests -q -W error -o asyncio_default_fixture_loop_scope=function
 ```
 
-For testing against a real Hermes checkout, set `PYTHONPATH`:
+The optional core-transport tests skip without a Hermes checkout. To include
+them, provide its source and transport dependencies in the test environment:
 
 ```bash
-PYTHONPATH=/path/to/hermes-agent python -m pytest -q
+HERMES_SOURCE=/path/to/hermes-agent python -m pytest tests -q -W error \
+  -o asyncio_default_fixture_loop_scope=function
 ```
+
+Run real `hermes plugins doctor /path/to/plugin --ci` separately. A standalone
+suite pass does not establish live gateway or client interoperability.
