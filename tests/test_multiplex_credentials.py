@@ -236,6 +236,22 @@ def test_adapter_fails_closed_under_multiplex(monkeypatch):
     assert adapter.validate_config(a.config) is False
 
 
+# --- voice setting isolation -------------------------------------------------
+
+@pytest.mark.parametrize("scope,enabled,hosts", [
+    (None, True, ("example.org", "*.example.org")),
+    ({}, True, ("example.org", "*.example.org")),
+    ({"XMPP_VOICE_TRANSCRIPTION": "false", "XMPP_VOICE_TRUSTED_HOSTS": "none"}, False, ()),
+])
+def test_voice_settings_never_inherit_launch_profile(monkeypatch, scope, enabled, hosts):
+    _reset(monkeypatch, multiplex=True, scope=scope)
+    monkeypatch.setenv("XMPP_VOICE_TRANSCRIPTION", "true")
+    monkeypatch.setenv("XMPP_VOICE_TRUSTED_HOSTS", "upload.launch.example")
+    a = adapter.XmppAdapter(_make_cfg())
+    assert a._voice_transcription_enabled is enabled
+    assert a._voice_trusted_hosts == hosts
+
+
 # --- yaml export guard -------------------------------------------------------
 
 def test_apply_yaml_config_does_not_export_under_multiplex(monkeypatch):

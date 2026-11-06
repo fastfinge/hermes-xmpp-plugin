@@ -2,6 +2,7 @@
 # Install with: uv pip install -r requirements.txt -r requirements-dev.txt
 pytest>=8
 pytest-asyncio>=0.25
+httpx==0.28.1  # Real HTTP streaming and pinned Hermes transport tests.
 
 # Optional runtime deps, required for the full test suite:
 # - slixmpp-omemo/omemo enable the OMEMO code paths (connect-resilience

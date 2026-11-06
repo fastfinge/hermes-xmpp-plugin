@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve outgoing voice SFS metadata, file hash, and upload URL by appending
+  the populated Slixmpp stanza. Send matching URL/body/OOB fallback for client
+  compatibility, with a whole-body XEP-0428 marker. Real serialization tests
+  cover DM and groupchat. Conversations playback still requires live acceptance.
+- Keep voice settings profile-scoped, accept list-valued sender allowlists, and
+  carry verified MUC-only grants through Hermes core without granting DM access.
+- Withhold encrypted reply keys even when fallback stripping removes the URL
+  scheme. Public redirects remain HTTPS and revalidate address policy without
+  buffering redirect bodies or blocking the gateway event loop.
+
+### Added
+
+- **Inbound voice notes → Hermes STT**: a message that is exactly one audio
+  attachment and no text (XEP-0066 OOB, XEP-0447 SFS with an `audio/*`
+  media type, or an OMEMO `aesgcm://` link per XEP-0454) is downloaded into
+  Hermes' audio cache and dispatched as a `MessageType.VOICE` event, so the
+  gateway transcribes it with the operator's configured `stt` provider
+  (local or remote) and uses the transcript as the prompt. Fetching reuses
+  Hermes core's SSRF-safe client and inbound media size cap; authorization
+  runs before any download. Captioned/multi-file/non-audio messages are
+  unchanged. Toggle with `voice_transcription` / `XMPP_VOICE_TRANSCRIPTION`
+  (default on). If the download fails the message falls back to the
+  previous plain-text behaviour.
+- **`voice_trusted_hosts`** (`XMPP_VOICE_TRUSTED_HOSTS`): upload hosts that
+  may resolve to LAN/tailnet addresses when fetching voice notes, without
+  turning on Hermes' global `allow_private_urls`. Defaults to the bot's own
+  XMPP domain and its subdomains; https-only, no redirects, metadata floor
+  and size cap kept. Other hosts still get Hermes' full SSRF checks.
+
 ## [0.4.0] — Connection reliability, OMEMO, and security fixes
 
 ### Added

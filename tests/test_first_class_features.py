@@ -711,6 +711,8 @@ async def test_muc_other_user_message_is_dispatched(fake_adapter):
     fake_adapter.handle_message = _capture
     fake_adapter.build_source = MagicMock(return_value=MagicMock())
 
+    fake_adapter.muc_allowed_users = {"alice@example.org"}
+    fake_adapter._muc_real_jid = lambda _: "alice@example.org"
     stanza = _make_groupchat_stanza(nick="alice", body="hey bot")
     await fake_adapter._on_message(stanza)
     assert len(events) == 1, "legitimate MUC message from another user was dropped"

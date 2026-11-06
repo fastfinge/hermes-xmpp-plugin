@@ -2,8 +2,10 @@ name: tests
 
 on:
   push:
-    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   pytest:
@@ -12,8 +14,18 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
+        hermes: [standalone, pinned]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check out supported Hermes core
+        if: matrix.hermes == 'pinned'
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: bf0203a794a07aac3ff764972ab9087baa4e4f4e
+          path: hermes-core
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -25,10 +37,12 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run test suite
+        env:
+          HERMES_SOURCE: ${{ matrix.hermes == 'pinned' && format('{0}/hermes-core', github.workspace) || '' }}
         # Deliberately no PYTHONPATH: the suite must pass in a standalone
         # plugin checkout (fake gateway/tools bootstrap in each test file).
         # If this goes red after a dep bump, check requirements*.txt pins
         # first — the suite historically rotted silently via missing dev
         # deps (52 dead async tests, unknown-mark warnings), so treat
         # warnings about unknown pytest marks as failures to investigate.
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q -W error -o asyncio_default_fixture_loop_scope=function
