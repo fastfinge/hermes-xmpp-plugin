@@ -133,19 +133,78 @@ def check_xmpp_requirements() -> bool:
 # OMEMO storage (JSON file backed)
 # ----------------------------------------------------------------
 
+class OmemoStoreError(RuntimeError):
+    """The OMEMO key file cannot be used safely; OMEMO stays off rather than risk the keys."""
+
+
+# Keep the process-lifetime descriptors reachable across adapter reloads/reimports.
+_OMEMO_LOCKS: dict[str, int] = sys.__dict__.setdefault("_hermes_xmpp_omemo_locks", {})
+# The key data per store: a second storage object for the same file in this process (a reconnect
+# that overlaps the old client) shares it, so neither can overwrite the other's newer keys.
+_OMEMO_DATA: dict[str, dict[str, Any]] = sys.__dict__.setdefault("_hermes_xmpp_omemo_data", {})
+
+
+def _lock_omemo_store(path: Path) -> None:
+    """One process per OMEMO store. Two processes would each keep their own copy of the double
+    ratchets and overwrite the other's file, which breaks every session and needs a manual
+    clean-up. The lock is held until the process exits."""
+    key = os.path.realpath(path)
+    if key in _OMEMO_LOCKS:
+        return
+    try:
+        import fcntl
+    except ImportError:
+        import msvcrt
+        fcntl = None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f"{key}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            # Windows locks a byte range starting at the current file position.
+            os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # pyrefly: ignore (Windows-only module)
+    except OSError as exc:
+        os.close(fd)
+        raise OmemoStoreError(f"{path} is in use by another process") from exc
+    _OMEMO_LOCKS[key] = fd
+
+
 if SLIXMPP_OMEMO_AVAILABLE:
     class _StorageImpl(Storage):  # type: ignore[misc]
-        """Simple JSON-file backed OMEMO storage."""
+        """JSON-file backed OMEMO storage: single-process, atomic, owner-only."""
 
         def __init__(self, json_file_path: Path) -> None:
             super().__init__()  # type: ignore[misc]
-            self._path = json_file_path
+            self._path = json_file_path.resolve()
             self._data: Dict[str, Any] = {}
-            try:
-                with open(self._path, encoding="utf-8") as f:
-                    self._data = json.load(f)
-            except Exception:
-                pass
+            _lock_omemo_store(self._path)
+            if (shared := _OMEMO_DATA.get(os.path.realpath(self._path))) is not None:
+                self._data = shared
+            elif self._path.exists():
+                if not self._path.stat().st_size:
+                    # What a crash between truncating and writing leaves behind. The keys are gone,
+                    # and starting empty would quietly create a new identity: make a person decide.
+                    raise OmemoStoreError(
+                        f"{self._path} is empty (an interrupted write?); not using OMEMO. "
+                        "Restore a backup or move the file away to start fresh."
+                    )
+                try:
+                    with open(self._path, encoding="utf-8") as f:
+                        self._data = json.load(f)
+                    if not isinstance(self._data, dict):
+                        raise ValueError("not a JSON object")
+                except Exception as exc:
+                    # Starting empty would overwrite the identity key on the next write.
+                    raise OmemoStoreError(
+                        f"{self._path} is unreadable ({exc}); not using OMEMO. "
+                        "Restore a backup or move the file away to start fresh."
+                    ) from exc
+                self._path.chmod(0o600)  # private keys
+            _OMEMO_DATA.setdefault(os.path.realpath(self._path), self._data)
 
         async def _load(self, key: str) -> Any:  # type: ignore[override]
             if key in self._data:
@@ -161,9 +220,21 @@ if SLIXMPP_OMEMO_AVAILABLE:
             self._save()
 
         def _save(self) -> None:
+            """Write a temp file, then rename it over the store: a crash leaves the old file."""
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._path, "w", encoding="utf-8") as f:
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+            if hasattr(os, "O_DIRECTORY"):  # POSIX: make the rename itself survive a power cut
+                dir_fd = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
 
     class _XEP_0384Impl(XEP_0384):  # type: ignore[misc,valid-type]
         """Concrete OMEMO plugin with BTBV and JSON-file storage."""
@@ -650,6 +721,7 @@ class XmppAdapter(BasePlatformAdapter):
         self._calls_host: Optional[Any] = None  # calls.hermes_host.HermesCallHost
         self._calls_loop: Optional[asyncio.AbstractEventLoop] = None  # loop that owns the calls
         self._calls_key = ""  # Hermes home this adapter registered its calls under
+        self._omemo_refreshed: Dict[str, float] = {}  # peer -> monotonic time of last device list download
         self._agent_peers: frozenset = frozenset(  # other agents: never called, rate-limited
             self._bare(j.strip()).lower()
             for j in _csv(extra.get("agent_peers", _scoped_getenv("XMPP_AGENT_PEERS", ""))).split(",")
@@ -662,6 +734,11 @@ class XmppAdapter(BasePlatformAdapter):
         self._call_tool_times: List[float] = []
         self._call_tool_lock = threading.Lock()
         self._call_request: tuple = (-1e9, "", "")  # (when, topic, context) of the last CALL REQUEST
+        self._plaintext_peers: frozenset = frozenset(
+            self._bare(j.strip()).lower()
+            for j in _csv(extra.get("plaintext_peers", _scoped_getenv("XMPP_PLAINTEXT_PEERS", ""))).split(",")
+            if j.strip()
+        )
         self._known_mucs = {r.room for r in self.muc_rooms}
         # Bare JIDs we have observed sending us 1:1 ("chat") messages. Used to
         # keep _is_muc() from misclassifying a real user as a group when the
@@ -1011,6 +1088,37 @@ class XmppAdapter(BasePlatformAdapter):
             return False
         recent.append(now)
         return True
+
+    def _use_omemo(self, chat_id: str, mtype: str) -> bool:
+        """Encrypt this outgoing message? Not to `plaintext_peers` (partner agents on the same
+        trusted server, whose OMEMO sessions would only get in the way)."""
+        return (
+            "xep_0384" in self._registered_plugins
+            and SLIXMPP_OMEMO_AVAILABLE
+            and mtype == "chat"
+            and self._bare(chat_id).lower() not in self._plaintext_peers
+        )
+
+    async def _refresh_omemo_devices(self, jid: Any) -> None:
+        """Download the peer's OMEMO device list before encrypting to them.
+
+        slixmpp-omemo skips the download whenever presence is mutual ("both"), trusting PEP
+        notifications to keep its cache current. If that notification never arrived (the usual
+        case for a fresh account or store), the cache stays empty and encryption fails with
+        NoEligibleDevices. Throttled to one download per peer per 10 minutes.
+        """
+        bare = self._bare(str(jid)).lower()
+        now = time.monotonic()
+        if now - self._omemo_refreshed.get(bare, -1e9) < 600:
+            return
+        self._omemo_refreshed[bare] = now
+        if len(self._omemo_refreshed) > 64:  # forget peers not contacted within the window
+            self._omemo_refreshed = {j: t for j, t in self._omemo_refreshed.items() if now - t < 600}
+        try:
+            await self.client["xep_0384"].refresh_device_lists({JID(bare)}, force_download=True)  # type: ignore[index]
+        except Exception:
+            self._omemo_refreshed.pop(bare, None)  # try again on the next send
+            logger.debug("xmpp: OMEMO device list refresh for %s failed", bare, exc_info=True)
 
     async def _connect_watchdog(self) -> None:
         try:
@@ -1842,11 +1950,7 @@ class XmppAdapter(BasePlatformAdapter):
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
 
         # OMEMO encrypt when available
-        if (
-            "xep_0384" in self._registered_plugins
-            and SLIXMPP_OMEMO_AVAILABLE
-            and mtype == "chat"
-        ):
+        if self._use_omemo(chat_id, mtype):
             try:
                 return await self._send_encrypted(chat_id, content)
             except Exception as exc:
@@ -1992,14 +2096,11 @@ class XmppAdapter(BasePlatformAdapter):
             )
 
             # OMEMO encrypt for 1:1 chats (same path as send())
-            if (
-                "xep_0384" in self._registered_plugins
-                and SLIXMPP_OMEMO_AVAILABLE
-                and mtype == "chat"
-            ):
+            if self._use_omemo(chat_id, mtype):
                 try:
                     xep_0384 = client_local["xep_0384"]
                     recipient_jid = JID(chat_id)
+                    await self._refresh_omemo_devices(recipient_jid)
                     encrypted, errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
                     if errors:
                         logger.info("OMEMO: edit encryption non-critical errors: %s", errors)
@@ -2148,6 +2249,7 @@ class XmppAdapter(BasePlatformAdapter):
         stanza.set_from(client_local.boundjid)
 
         recipient_jid = JID(chat_id)
+        await self._refresh_omemo_devices(recipient_jid)
         message, encryption_errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
 
         if encryption_errors:
@@ -2610,6 +2712,9 @@ async def send_xmpp_message(
     # Ephemeral resource on the account — must not consult or release the
     # gateway adapter's per-JID scoped lock (compare IRC's "-cron" nick).
     adapter._ephemeral_sender = True
+    # A second process must not touch the gateway's OMEMO store: both would advance the same
+    # double ratchets and the live adapter's sessions break ("Key material decryption failed").
+    adapter._omemo_enabled = False
     if not check_xmpp_requirements():
         return {"success": False, "error": "slixmpp not installed"}
     try:
@@ -3419,7 +3524,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     for key in (
         "jid", "password", "host", "port", "direct_tls", "connect_timeout_secs",
         "muc_rooms", "muc_nick", "allowed_users", "muc_allowed_users", "allow_all_users", "max_message_length",
-        "voice_transcription", "voice_trusted_hosts", "calls", "agent_peers", "agent_peer_limit", "message_tool_limit",
+        "voice_transcription", "voice_trusted_hosts", "calls", "plaintext_peers", "agent_peers", "agent_peer_limit", "message_tool_limit",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]

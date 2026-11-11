@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import sys
 import threading
 import types
 import wave
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -346,10 +348,19 @@ def test_partner_agent_may_chat_but_never_phone(monkeypatch):
     assert out["success"] is True and seen == ["user@example.org"]
 
 
+def test_plaintext_peers_are_never_omemo_encrypted():
+    a = make_adapter(plaintext_peers=["Agent@Example.org"])
+    a._registered_plugins = {"xep_0384"}
+    on = adapter.SLIXMPP_OMEMO_AVAILABLE
+    assert a._use_omemo("user@example.org", "chat") is on
+    assert a._use_omemo("agent@example.org/res", "chat") is False
+    assert a._use_omemo("room@conference.example.org", "groupchat") is False
+
+
 def test_callable_people_exclude_partner_agents_by_default():
     a = make_adapter(
         allowed_users="user@example.org,wife@example.org,agent@example.org",
-        agent_peers=["agent@example.org"],
+        plaintext_peers=["agent@example.org"],
         calls={"enabled": True},
     )
     a._build_calls(MagicMock())
@@ -367,6 +378,35 @@ def test_ambiguous_target_lists_the_choices(monkeypatch):
     out = json.loads(adapter._xmpp_call_tool({"opening": "hi"}))
     assert out["success"] is False
     assert "a@example.org, b@example.org" in out["status"]
+
+
+def test_omemo_device_lists_are_downloaded_once_per_ten_minutes():
+    a = make_adapter()
+    calls = []
+
+    async def refresh(jids, force_download=False):
+        calls.append((sorted(str(j) for j in jids), force_download))
+
+    a.client = MagicMock()
+    a.client.__getitem__.return_value.refresh_device_lists = refresh
+
+    async def run():
+        await a._refresh_omemo_devices("User@Example.org/phone")
+        await a._refresh_omemo_devices("user@example.org")  # throttled
+        await a._refresh_omemo_devices("other@example.org")
+
+    asyncio.run(run())
+    assert calls == [(["user@example.org"], True), (["other@example.org"], True)]
+
+
+def test_omemo_download_times_are_pruned_so_the_dict_does_not_grow_forever(monkeypatch):
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: 10_000.0)  # not the host's uptime
+    a = make_adapter()
+    a.client = MagicMock()
+    a.client.__getitem__.return_value.refresh_device_lists = AsyncMock()
+    a._omemo_refreshed = {f"old{i}@example.org": 0.0 for i in range(100)}
+    asyncio.run(a._refresh_omemo_devices("new@example.org"))
+    assert set(a._omemo_refreshed) == {"new@example.org"}
 
 
 def test_partner_agent_messages_are_rate_limited(monkeypatch):
@@ -430,6 +470,24 @@ def test_status_lines_are_not_sent_to_a_partner_agent():
     result = asyncio.run(a.send("agent@example.org", "⚠️ The model returned only a silence marker"))
     assert result.success
     a.client.make_message.assert_not_called()
+
+
+def test_one_shot_sender_never_uses_omemo(monkeypatch):
+    """It shares the account (and the OMEMO store file) with the live gateway adapter."""
+    seen = {}
+
+    async def fake_connect(self, *a, **k):
+        seen["omemo"] = self._omemo_enabled
+        self.fatal_error_message = "stop here"
+        return False
+
+    monkeypatch.setattr(adapter.XmppAdapter, "connect", fake_connect)
+    monkeypatch.setattr(adapter.XmppAdapter, "disconnect", lambda self: asyncio.sleep(0))
+    monkeypatch.setattr(adapter, "check_xmpp_requirements", lambda: True)
+    cfg = MagicMock()
+    cfg.extra = {"jid": "hermes@example.org", "password": "x", "omemo": {"enabled": True}}
+    asyncio.run(adapter.send_xmpp_message(cfg, "user@example.org", "hi"))
+    assert seen["omemo"] is False
 
 
 def test_call_request_topic_and_context_reach_the_tool_without_the_model(monkeypatch):
@@ -521,6 +579,75 @@ def test_a_stt_command_that_hears_nothing_is_an_empty_transcript(monkeypatch):
         asyncio.run(a._calls_host.speech.transcribe(np.zeros(1600, np.int16)))
 
 
+# ------------------------------------------------------------ OMEMO key safety
+
+omemo = pytest.mark.skipif(not adapter.SLIXMPP_OMEMO_AVAILABLE, reason="slixmpp-omemo not installed")
+
+
+@omemo
+def test_omemo_store_is_atomic_and_private(tmp_path):
+    path = tmp_path / "omemo.json"
+    store = adapter._StorageImpl(path)
+    asyncio.run(store._store("/ikp/key", "secret"))
+    assert json.loads(path.read_text()) == {"/ikp/key": "secret"}
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert not list(tmp_path.glob("*.tmp"))  # the temp file was renamed over the store
+
+
+@omemo
+def test_omemo_store_write_syncs_the_file_and_its_directory(tmp_path, monkeypatch):
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_mode), real(fd)))
+    store = adapter._StorageImpl(tmp_path / "omemo.json")
+    asyncio.run(store._store("/a", "one"))
+    assert [stat.S_ISDIR(mode) for mode in synced] == [False, True]  # the file, then the rename
+
+
+@omemo
+def test_omemo_store_that_cannot_be_read_is_never_overwritten(tmp_path):
+    path = tmp_path / "omemo.json"
+    path.write_text('{"/ikp/key": "secret"')  # cut off mid-write
+    with pytest.raises(adapter.OmemoStoreError):
+        adapter._StorageImpl(path)
+    assert path.read_text() == '{"/ikp/key": "secret"'  # untouched: nothing was reset
+
+
+@omemo
+def test_omemo_store_that_is_empty_is_never_replaced(tmp_path):
+    path = tmp_path / "omemo.json"
+    path.write_text("")  # what a crash between truncating and writing leaves
+    with pytest.raises(adapter.OmemoStoreError, match="empty"):
+        adapter._StorageImpl(path)
+    assert path.read_text() == ""  # no new identity was written over it
+
+
+@omemo
+def test_omemo_store_is_refused_to_a_second_process(tmp_path):
+    import fcntl
+    import os
+
+    path = tmp_path / "omemo.json"
+    other = os.open(f"{os.path.realpath(path)}.lock", os.O_CREAT | os.O_RDWR)
+    fcntl.flock(other, fcntl.LOCK_EX)  # another process holds the store
+    try:
+        with pytest.raises(adapter.OmemoStoreError):
+            adapter._StorageImpl(path)
+    finally:
+        os.close(other)
+    adapter._StorageImpl(path)  # free again
+    adapter._StorageImpl(path)  # the same process may reopen it (reconnects)
+
+
+@omemo
+def test_world_readable_key_file_is_locked_down(tmp_path):
+    path = tmp_path / "omemo.json"
+    path.write_text("{}")
+    path.chmod(0o644)
+    adapter._StorageImpl(path)
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
 def test_xmpp_message_tool_is_rate_limited(monkeypatch):
     a = make_adapter(allowed_users="user@example.org", agent_peers=["agent@example.org"], message_tool_limit=3, calls={"enabled": True})
     loop, thread = run_loop_in_thread()
@@ -559,3 +686,11 @@ def test_xmpp_call_tool_refuses_a_long_opening_and_limits_calls(monkeypatch):
         stop_loop(loop, thread)
     assert all(r["success"] for r in results[:-1])
     assert not results[-1]["success"] and "too many calls" in results[-1]["status"]
+
+@omemo
+def test_two_storages_for_one_file_in_a_process_do_not_overwrite_each_other(tmp_path):
+    path = tmp_path / "omemo.json"
+    first, second = adapter._StorageImpl(path), adapter._StorageImpl(path)  # e.g. a reconnect
+    asyncio.run(first._store("/a", "one"))
+    asyncio.run(second._store("/b", "two"))
+    assert json.loads(path.read_text()) == {"/a": "one", "/b": "two"}

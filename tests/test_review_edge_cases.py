@@ -84,6 +84,128 @@ NUMERIC_CALL_KEYS = [
 ]
 
 
+@pytest.mark.parametrize("reload_module", [False, True])
+def test_reimport_reuses_live_store_lock_and_preserves_identity(tmp_path, reload_module):
+    path = tmp_path / "store.json"
+    first = adapter._StorageImpl(path)
+    asyncio.run(first._store("identity", "fixture-identity"))
+    before = dict(adapter._OMEMO_LOCKS)
+    reimported = load_adapter(adapter if reload_module else None)
+    assert (reimported is adapter) == reload_module
+    reopened = reimported._StorageImpl(path)
+    assert reopened._data == {"identity": "fixture-identity"}
+    assert before == reimported._OMEMO_LOCKS
+    assert reimported._OMEMO_LOCKS is adapter._OMEMO_LOCKS
+
+    # An exec'd interpreter must still be excluded while either adapter is live.
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "import runpy, sys\n"
+            "sys.path.insert(0, str(__import__('pathlib').Path(sys.argv[1]).parent))\n"
+            "a = runpy.run_path(sys.argv[1])['adapter']\n"
+            "try:\n a._StorageImpl(a.Path(sys.argv[2]))\n"
+            "except a.OmemoStoreError:\n sys.exit(0)\n"
+            "sys.exit(1)\n",
+            str(Path(__file__)),
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    asyncio.run(first._store("counter", 1))
+    assert json.loads(path.read_text()) == {"identity": "fixture-identity", "counter": 1}
+
+
+def test_a_store_written_by_the_previous_version_loads_unchanged_and_stays_readable(tmp_path):
+    """No conversion: same plain JSON object, only the file mode and a lock file are new."""
+    path = tmp_path / "old.json"
+    old = {"/own/identity": {"key": "fixture"}, "/devices/a@b": [1, 2]}
+    path.write_text(json.dumps(old, indent=2))  # exactly what the previous _save wrote
+    path.chmod(0o644)
+    store = adapter._StorageImpl(path)
+    assert store._data == old
+    asyncio.run(store._store("/new", 1))
+    assert json.loads(path.read_text()) == {**old, "/new": 1}  # the previous code can read it back
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["old.json", "old.json.lock"]
+
+
+def test_atomic_save_follows_symlink_without_replacing_it(tmp_path, monkeypatch):
+    target = tmp_path / "keys" / "target.json"
+    target.parent.mkdir()
+    target.write_text('{"identity": "fixture-identity"}')
+    link = tmp_path / "store.json"
+    link.symlink_to(target)
+    store = adapter._StorageImpl(link)
+    asyncio.run(store._store("counter", 1))
+    assert link.is_symlink()
+    expected = {"identity": "fixture-identity", "counter": 1}
+    assert json.loads(target.read_text()) == expected
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert not list(target.parent.glob("*.tmp"))
+    before = dict(adapter._OMEMO_LOCKS)
+    adapter._StorageImpl(target)
+    assert before == adapter._OMEMO_LOCKS
+
+    def interrupted_replace(src, dst):
+        assert dst == target
+        assert json.loads(target.read_text()) == expected
+        raise OSError("synthetic interrupted replace")
+
+    monkeypatch.setattr(adapter.os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="interrupted replace"):
+        asyncio.run(store._store("counter", 2))
+    assert json.loads(target.read_text()) == expected
+    assert link.is_symlink()
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_windows_lock_is_nonblocking_and_exclusive_without_fcntl(tmp_path, monkeypatch, busy):
+    import builtins
+
+    original_import = builtins.__import__
+    descriptors = []
+
+    def locking(fd, mode, length):
+        descriptors.append(fd)
+        assert mode == 2  # msvcrt.LK_NBLCK
+        assert length == 1
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+        assert os.fstat(fd).st_size >= 1
+        if busy:
+            raise OSError("synthetic lock contention")
+
+    windows = types.SimpleNamespace(LK_NBLCK=2, locking=locking)
+
+    def windows_import(name, *args, **kwargs):
+        if name == "fcntl":
+            raise ImportError("Windows has no fcntl")
+        if name == "msvcrt":
+            return windows
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", windows_import)
+    path = tmp_path / "store.json"
+    if busy:
+        with pytest.raises(adapter.OmemoStoreError, match="another process"):
+            adapter._StorageImpl(path)
+        assert str(path) not in adapter._OMEMO_LOCKS
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(descriptors[0])
+    else:
+        store = adapter._StorageImpl(path)
+        asyncio.run(store._store("identity", "fixture-identity"))
+        assert json.loads(path.read_text()) == {"identity": "fixture-identity"}
+        assert adapter._OMEMO_LOCKS[str(path)] == descriptors[0]
+        adapter._StorageImpl(path)  # same-process reconnect keeps the lock
+        assert len(descriptors) == 1
+
+
 def test_call_settings_defaults_overrides_and_garbage():
     """One table per behaviour; every failing case is listed, not just the first."""
     defaults = adapter._calls_settings({})
