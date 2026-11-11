@@ -68,3 +68,11 @@ async def test_voice_wire_contains_sfs_and_matching_legacy_url(tmp_path, monkeyp
     assert fallback.get("for") == "urn:xmpp:sfs:0"
     bodies = fallback.findall("{urn:xmpp:fallback:0}body")
     assert len(bodies) == 1 and not bodies[0].attrib
+
+
+def test_content_type_falls_back_to_the_voice_table_without_system_mime_types(monkeypatch):
+    # Python < 3.14 knows .ogg only from /etc/mime.types, which minimal hosts and containers lack.
+    monkeypatch.setattr(adapter.mimetypes, "guess_type", lambda path: (None, None))
+    assert adapter._guess_content_type("/tmp/Voice.OGG") == "audio/ogg"
+    assert adapter._guess_content_type("/tmp/note.m4a") == "audio/mp4"
+    assert adapter._guess_content_type("/tmp/readme.txt") is None
