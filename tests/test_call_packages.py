@@ -33,6 +33,18 @@ def test_requirements_are_read_from_the_file(mod):
     assert all("#" not in line for line in mod.requirements())
 
 
+def test_partially_installed_packages_still_build_the_environment(mod, monkeypatch):
+    """aiortc present but webrtcvad absent must not short-circuit: the engine needs all four."""
+    called = []
+    fake_pm(monkeypatch, lambda *a, **k: called.append(a) or "/env/bin/python")
+    monkeypatch.setattr(mod, "_site_packages", lambda python: "/env/lib/site-packages")
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a: object() if name == "aiortc" else None
+    )
+    mod.provide()
+    assert called and sys.path[-1] == "/env/lib/site-packages"
+
+
 def test_environment_site_packages_join_the_end_of_sys_path(mod, monkeypatch):
     seen = {}
 

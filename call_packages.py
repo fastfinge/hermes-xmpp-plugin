@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 ENV_NAME = "hermes-xmpp-calls"
 _PLUGIN_DIR = Path(__file__).resolve().parent
+# Every package the call engine imports. A partially satisfied set is not usable: a Hermes
+# environment that already ships aiortc (it does on some hosts) but not webrtcvad would otherwise
+# skip the environment below and fail at the first call with ModuleNotFoundError.
+_NEEDED = ("aiortc", "av", "numpy", "webrtcvad")
 
 
 def requirements() -> list[str]:
@@ -39,7 +43,8 @@ def _site_packages(python: str) -> str:
 
 def provide() -> None:
     """Never raises. On failure the caller's import fails and logs what to install by hand."""
-    if importlib.util.find_spec("aiortc") is not None:
+    missing = [name for name in _NEEDED if importlib.util.find_spec(name) is None]
+    if not missing:
         return
     vendor = _PLUGIN_DIR / "vendor"
     try:
@@ -53,7 +58,10 @@ def provide() -> None:
             root = Path(get_default_hermes_root()) / "environments" / ENV_NAME
         except ImportError:
             pass
-        logger.info("xmpp: preparing the call packages environment (first start can take a minute)")
+        logger.info(
+            "xmpp: preparing the call packages environment (%s missing; first start can take a minute)",
+            ", ".join(missing),
+        )
         python = pm.ensure_environment(ENV_NAME, requirements(), root=root)
         path = _site_packages(str(python))
         if path not in sys.path:
