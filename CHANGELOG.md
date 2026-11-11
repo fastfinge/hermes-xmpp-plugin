@@ -4,20 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
-
-- Preserve outgoing voice SFS metadata, file hash, and upload URL by appending
-  the populated Slixmpp stanza. Send matching URL/body/OOB fallback for client
-  compatibility, with a whole-body XEP-0428 marker. Real serialization tests
-  cover DM and groupchat. Conversations playback still requires live acceptance.
-- Keep voice settings profile-scoped, accept list-valued sender allowlists, and
-  carry verified MUC-only grants through Hermes core without granting DM access.
-- Withhold encrypted reply keys even when fallback stripping removes the URL
-  scheme. Public redirects remain HTTPS and revalidate address policy without
-  buffering redirect bodies or blocking the gateway event loop.
+## [0.5.0] — Audio calls and agent hand-off
 
 ### Added
 
+- `xmpp.calls.filler`: the "One moment." filler is now a string or list (six built-in phrases,
+  picked at random, never twice in a row; `""` turns it off). Each phrase is synthesized once and
+  kept in `<HERMES_HOME>/cache/xmpp-calls/`. Calls need Python 3.13 or newer.
+- `xmpp.calls.allowed_users` and `xmpp.calls.hangup_grace` (warning beeps and a speaking
+  window before a planned hang-up).
+
+- **Audio calls (Jingle RTP, optional)**: `xmpp.calls.enabled` lets allowed JIDs call the bot
+  (XEP-0166/0167/0176/0320/0353 over aiortc). Speech goes through the configured `stt` and `tts`
+  providers, replies are normal agent turns, barge-in and a spoken hang-up are supported. Code
+  lives in `calls/`; its packages (`requirements-calls.txt`, about 230 MB) get their own Hermes environment (`pm.ensure_environment`) on the first start with calls on, so they are optional and survive `hermes update`; a `vendor/` folder is the fallback. Off by default. `xmpp_message` works with calls off. The `xmpp_call` agent tool places an outgoing call (also usable from cron jobs).
 - **Inbound voice notes → Hermes STT**: a message that is exactly one audio
   attachment and no text (XEP-0066 OOB, XEP-0447 SFS with an `audio/*`
   media type, or an OMEMO `aesgcm://` link per XEP-0454) is downloaded into
@@ -34,6 +34,31 @@ All notable changes to this project will be documented in this file.
   turning on Hermes' global `allow_private_urls`. Defaults to the bot's own
   XMPP domain and its subdomains; https-only, no redirects, metadata floor
   and size cap kept. Other hosts still get Hermes' full SSRF checks.
+
+### Fixed
+
+- Preserve queued caller requests across goodbye replies, recoverable agent failures and steering
+  races. Coalesce concurrent hang-up grace checks; prevent late STT/TTS after terminal cleanup.
+- Apply sentence-level playback backpressure. Filler synthesis failure no longer discards a
+  successful agent result; zero-length preroll does not retain silence indefinitely.
+- Register pending sessions before TURN discovery, retain early candidates, and honor early
+  termination. Disconnect prevents late outgoing answers from creating calls. Remote termination
+  wakes setup waits immediately instead of becoming a false timeout.
+- Reject unsupported multi-content audio/video offers and unsupported Jingle actions explicitly.
+  Handle authenticated received JMI carbons, retractions, duplicate and stale proposals; use the
+  standard `cancel` termination reason.
+- Default invalid/nonfinite numeric settings safely even when calls are off; normalize tool
+  targets and process partner filters and request metadata after OMEMO decryption.
+
+- Preserve outgoing voice SFS metadata, file hash, and upload URL by appending
+  the populated Slixmpp stanza. Send matching URL/body/OOB fallback for client
+  compatibility, with a whole-body XEP-0428 marker. Real serialization tests
+  cover DM and groupchat. Conversations playback still requires live acceptance.
+- Keep voice settings profile-scoped, accept list-valued sender allowlists, and
+  carry verified MUC-only grants through Hermes core without granting DM access.
+- Withhold encrypted reply keys even when fallback stripping removes the URL
+  scheme. Public redirects remain HTTPS and revalidate address policy without
+  buffering redirect bodies or blocking the gateway event loop.
 
 ## [0.4.0] — Connection reliability, OMEMO, and security fixes
 

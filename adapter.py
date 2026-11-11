@@ -57,9 +57,13 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import mimetypes
 import os
+import re
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -404,6 +408,28 @@ def _find_omemo_plugin(client: Any) -> Any:
 # Adapter
 # ----------------------------------------------------------------
 
+_AGENT_PEER_LIMIT = 4  # messages per 10 minutes accepted from one partner agent
+_MESSAGE_TOOL_LIMIT = 10  # xmpp_message sends per recipient per 10 minutes
+_CALL_TOOL_LIMIT = 6  # xmpp_call placements per hour
+_OPENING_LIMIT = 1500  # characters an agent may speak when it places a call
+# Gateway status lines ("⚡ Interrupting...", "⚙️ tool_search...") the other agent's gateway
+# sends as chat; answering them would keep two agents talking forever.
+_NOTICE_PREFIXES = ("⚡ Interrupting", "⚙", "📞", "⏳", "💭", "🔧", "⏩", "🔄", "💾")
+_NOTICE_PHRASES = ("returned only a silence marker",)  # the gateway's reply to a bare [SILENT]
+
+
+def _is_gateway_notice(text: str) -> bool:
+    text = (text or "").lstrip()
+    return text.startswith(_NOTICE_PREFIXES) or any(p in text for p in _NOTICE_PHRASES)
+
+
+_AGENT_PROMPT = (
+    "This message comes from another automated agent, not from a person. Do not chat, thank or "
+    "acknowledge it. If it asks for work, do it; if it needs no action, your whole reply must be "
+    "exactly [SILENT]."
+)
+
+
 class XmppAdapter(BasePlatformAdapter):
     """slixmpp-backed adapter satisfying BasePlatformAdapter."""
 
@@ -492,7 +518,7 @@ class XmppAdapter(BasePlatformAdapter):
                 _max_len = int(_max_len_raw)
                 if _max_len > 0:
                     self.MAX_MESSAGE_LENGTH = _max_len
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 logger.warning("xmpp: invalid max_message_length %r, using default", _max_len_raw)
 
         # Allow operators on a slow/high-latency link to the server to raise
@@ -504,9 +530,9 @@ class XmppAdapter(BasePlatformAdapter):
         if _connect_timeout_raw:
             try:
                 _connect_timeout = float(_connect_timeout_raw)
-                if _connect_timeout > 0:
+                if math.isfinite(_connect_timeout) and _connect_timeout > 0:
                     self._CONNECT_TIMEOUT_SECS = _connect_timeout
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 logger.warning(
                     "xmpp: invalid connect_timeout_secs %r, using default", _connect_timeout_raw
                 )
@@ -514,7 +540,11 @@ class XmppAdapter(BasePlatformAdapter):
         self.jid: str = str(extra.get("jid") or _scoped_getenv("XMPP_JID", "")).strip()
         self._password: str = str(extra.get("password") or _scoped_getenv("XMPP_PASSWORD", "")).strip()
         self.host: Optional[str] = extra.get("host") or _scoped_getenv("XMPP_HOST") or None
-        self.port: int = int(extra.get("port") or _scoped_getenv("XMPP_PORT", "5222") or 5222)
+        try:
+            self.port: int = int(extra.get("port") or _scoped_getenv("XMPP_PORT", "5222") or 5222)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("xmpp: invalid port, using default")
+            self.port = 5222
         # IPv6 tri-state: None = auto-detect a working global v6 route at
         # connect time. Explicit true/false via XMPP_USE_IPV6 / use_ipv6.
         # NOTE: a YAML `use_ipv6: false` arrives as a real Python bool, and
@@ -597,6 +627,22 @@ class XmppAdapter(BasePlatformAdapter):
         # an outage and escalate it to a reconnect (#28919).
         self._closing = False
         self._self_bare = self._bare(self.jid)
+        # Audio calls (Jingle RTP). Off by default; see the README "Audio calls" section.
+        self._calls_cfg: Dict[str, Any] = _calls_settings(extra)
+        self._calls: Optional[Any] = None  # calls.controller.CallController while connected
+        self._calls_host: Optional[Any] = None  # calls.hermes_host.HermesCallHost
+        self._calls_loop: Optional[asyncio.AbstractEventLoop] = None  # loop that owns the calls
+        self._calls_key = ""  # Hermes home this adapter registered its calls under
+        self._agent_peers: frozenset = frozenset(  # other agents: never called, rate-limited
+            self._bare(j.strip()).lower()
+            for j in _csv(extra.get("agent_peers", _scoped_getenv("XMPP_AGENT_PEERS", ""))).split(",")
+            if j.strip()
+        )
+        self._agent_peer_times: Dict[str, List[float]] = {}
+        self._message_tool_times: Dict[str, List[float]] = {}
+        self._call_tool_times: List[float] = []
+        self._call_tool_lock = threading.Lock()
+        self._call_request: tuple = (-1e9, "", "")  # (when, topic, context) of the last CALL REQUEST
         self._known_mucs = {r.room for r in self.muc_rooms}
         # Bare JIDs we have observed sending us 1:1 ("chat") messages. Used to
         # keep _is_muc() from misclassifying a real user as a group when the
@@ -756,6 +802,11 @@ class XmppAdapter(BasePlatformAdapter):
         # plugins (xep_0030, xep_0045, xep_0199, ...) key their own
         # post-connect setup off for exactly this reason.
         client.add_event_handler("session_bind", self._on_session_bind)
+        if self._calls_cfg["enabled"] and not self._ephemeral_sender:
+            await self._await_call_packages()
+        self._calls = self._build_calls(client) if not self._ephemeral_sender else None
+        if not self._ephemeral_sender:
+            self._register_for_tools()
         # slixmpp dispatches MUC stanzas to BOTH "message" and
         # "groupchat_message", so registering _on_message for both would run it
         # twice for every group-chat message. Register "message" only — it
@@ -836,6 +887,111 @@ class XmppAdapter(BasePlatformAdapter):
         self._mark_connected()
         return True
 
+    def _register_for_tools(self) -> None:
+        """The agent tools find this adapter here. `xmpp_message` needs only the connection, so
+        this happens whether or not calls are enabled."""
+        self._calls_key = _home_key()
+        _CALL_ADAPTERS[self._calls_key] = self
+        try:
+            self._calls_loop = asyncio.get_running_loop()  # connect() runs on it
+        except RuntimeError:
+            self._calls_loop = None
+
+    async def _await_call_packages(self, timeout: float = 15.0) -> None:
+        """Give the call packages a short head start. The first start downloads ~230 MB, and the
+        gateway gives connect() 30 s, so a slow build continues in its thread while chat starts;
+        calls come with the next reconnect or restart."""
+        task = asyncio.ensure_future(asyncio.to_thread(self._provide_call_packages))
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            logger.warning(
+                "xmpp: the call packages are still being prepared; chat starts now, "
+                "calls start after the next reconnect or gateway restart"
+            )
+
+    def _provide_call_packages(self) -> None:
+        """Blocking on the first start (builds an environment); never raises. See call_packages."""
+        try:
+            from importlib import import_module
+
+            import_module(f"{__package__}.call_packages" if __package__ else "call_packages").provide()
+        except Exception:
+            logger.exception("xmpp: could not prepare the call packages")
+
+    def _build_calls(self, client: Any) -> Optional[Any]:
+        """Create the call controller when calls are enabled and their dependencies import.
+
+        Never raises: a missing aiortc/av must not take chat down with it.
+        """
+        self._calls_host = None
+        if not self._calls_cfg["enabled"]:
+            return None
+        try:
+            from importlib import import_module
+
+            base = f"{__package__}.calls" if __package__ else "calls"
+            controller = import_module(f"{base}.controller")
+            host_module = import_module(f"{base}.hermes_host")
+            client.register_plugin("xep_0115")
+            self._calls_host = host_module.HermesCallHost(
+                self, frozenset(self._calls_cfg["allowed_users"])
+            )
+            config = controller.CallConfig(
+                max_seconds=self._calls_cfg["max_seconds"],
+                greeting=self._calls_cfg["greeting"],
+                filler_after=self._calls_cfg["filler_after"],
+                **({"fillers": self._calls_cfg["filler"]} if self._calls_cfg["filler"] is not None else {}),
+                filler_cache=Path(_hermes_home()) / "cache" / "xmpp-calls",
+                ring_timeout=self._calls_cfg["ring_timeout"],
+                silence_ms=self._calls_cfg["silence_ms"],
+                vad_level=self._calls_cfg["vad_level"],
+                ack_tone=self._calls_cfg["ack_tone"],
+                barge_in=self._calls_cfg["barge_in"],
+                hangup_grace=self._calls_cfg["hangup_grace"],
+                recap=self._calls_cfg["recap"],
+                idle_timeout=self._calls_cfg["idle_timeout"],
+                log_transcripts=self._calls_cfg["log_transcripts"],
+                busy_wait=self._calls_cfg["busy_wait"],
+                ring_attempts=self._calls_cfg["ring_attempts"],
+                ring_pause=self._calls_cfg["ring_pause"],
+            )
+            calls = controller.CallController(client, self._calls_host, config)
+            calls.install()
+            logger.info("xmpp: audio calls enabled")
+            return calls
+        except Exception as exc:
+            logger.warning(
+                "xmpp: calls are enabled but unavailable (%s); "
+                "install the call packages (see the README, Calls quick start). "
+                "Chat continues without calls.",
+                exc,
+            )
+            self._calls_host = None
+            return None
+
+    def _note_call_request(self, body: str) -> None:
+        """A partner agent asked us to phone the operator ("CALL REQUEST ... topic=x"): keep its
+        topic and the text between the first line and "BRIEFING:" (REF, edit playbook), so the
+        `xmpp_call` tool can use them even when the model forgets to pass them."""
+        if not body.lstrip().startswith("CALL REQUEST"):
+            return
+        head, _, rest = body.partition("\n")
+        topic = re.search(r"topic=([\w.:-]+)", head)
+        context = rest.split("BRIEFING:", 1)[0].strip()
+        self._call_request = (time.monotonic(), topic.group(1).rstrip(".") if topic else "", context)
+
+    def _agent_peer_may_speak(self, peer: str) -> bool:
+        """Loop guard: two agents that answer each other never stop. Accept at most
+        `_AGENT_PEER_LIMIT` messages per 10 minutes from a partner agent; drop the rest."""
+        now = time.monotonic()
+        recent = self._agent_peer_times.setdefault(peer, [])
+        recent[:] = [t for t in recent if now - t < 600]
+        if len(recent) >= _AGENT_PEER_LIMIT:
+            logger.warning("xmpp: dropping message from agent peer %s (over %d per 10 min)", peer, _AGENT_PEER_LIMIT)
+            return False
+        recent.append(now)
+        return True
+
     async def _connect_watchdog(self) -> None:
         try:
             await asyncio.wait_for(
@@ -858,6 +1014,14 @@ class XmppAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._closing = True
+        if self._calls is not None:
+            try:
+                await self._calls.close()  # hang up open calls while the stream is still up
+            except Exception:
+                logger.exception("xmpp: closing calls failed")
+            self._calls = self._calls_host = None
+        if _CALL_ADAPTERS.get(getattr(self, "_calls_key", "")) is self:
+            del _CALL_ADAPTERS[self._calls_key]
         # Capture the client once: teardown below must work from this
         # reference even though self.client is cleared unconditionally.
         client = self.client
@@ -1151,6 +1315,11 @@ class XmppAdapter(BasePlatformAdapter):
         if self._session_ready is not None:
             self._session_ready.set()
         logger.info("xmpp: marking session ready")
+        if self._calls is not None:
+            try:
+                await self._calls.advertise()  # before presence, so the caps hash covers calls
+            except Exception:
+                logger.exception("xmpp: advertising call features failed")
         try:
             self.client.send_presence()  # type: ignore[union-attr]
         except Exception:
@@ -1310,6 +1479,11 @@ class XmppAdapter(BasePlatformAdapter):
                         logger.warning("OMEMO: failed to decrypt message from %s: %s", from_bare, exc)
                         return
 
+            if user_id.lower() in self._agent_peers:
+                if _is_gateway_notice(body) or not self._agent_peer_may_speak(user_id.lower()):
+                    return
+                self._note_call_request(body)  # only decrypted text that passed the loop guard
+
             # ----------------------------------------------------------------
             # Inbound XEP-0004 form submission (clarify response)
             # ----------------------------------------------------------------
@@ -1441,6 +1615,8 @@ class XmppAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
             )
+            if user_id.lower() in self._agent_peers:
+                event.channel_prompt = _AGENT_PROMPT
             await self.handle_message(event)
         except Exception:
             logger.exception("xmpp: error handling inbound stanza")
@@ -1610,6 +1786,25 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self.client is None or not getattr(self, "_running", True):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
+
+        # Gateway status lines ("⚠️ The model returned only a silence marker...") never go to a
+        # partner agent: it would answer them and the two would talk forever.
+        if (
+            content
+            and self._bare(chat_id).lower() in self._agent_peers
+            and _is_gateway_notice(content)
+        ):
+            logger.info("xmpp: not sending a status line to agent peer %s", chat_id)
+            return SendResult(success=True)
+
+        # A reply to a spoken call turn is read aloud by the call, not sent as text.
+        if (
+            self._calls_host is not None
+            and content
+            and not (voice_path or document_path or image_paths)
+            and self._calls_host.capture(self._bare(chat_id), content, reply_to)
+        ):
+            return SendResult(success=True)
 
         # Forward legacy media params to dedicated methods
         if voice_path:
@@ -2128,6 +2323,8 @@ class XmppAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
+        if self._calls_host is not None:
+            self._calls_host.complete(event.source.chat_id, event.message_id)
         if not self._reactions_allowed(event):
             return
         if outcome == ProcessingOutcome.CANCELLED:
@@ -2725,8 +2922,271 @@ async def _cache_audio_bytes(data: bytes, ext: str) -> str:
 # Registration helpers
 # ---------------------------------------------------------------------
 
+_CALL_GREETING = "Hi, I'm here. What can I do for you?"
+# Adapters with live calls, by Hermes home. One gateway process may serve several profiles
+# (multiplex_profiles), each with its own XMPP account; the agent tool finds its own profile's.
+_CALL_ADAPTERS: Dict[str, "XmppAdapter"] = {}
+
+
+def _home_key() -> str:
+    return os.path.realpath(_hermes_home())
+
+
+def _live_adapter() -> Optional["XmppAdapter"]:
+    return _CALL_ADAPTERS.get(_home_key())
+
+_CALL_TOOL_SCHEMA = {
+    "name": "xmpp_call",
+    "description": (
+        "Place a voice call to the user over XMPP and speak an opening (a line or a whole briefing) "
+        "when they answer; unless hang_up_after is set the conversation then continues by voice. "
+        "Use only when something warrants interrupting them (an urgent alert, a finished task "
+        "they asked to be told about). One call at a time. Returns whether the call connected, "
+        "was declined, or went unanswered. The call keeps running after this returns."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "opening": {
+                "type": "string",
+                "description": (
+                    "What you say as soon as they answer. A short greeting, or a whole briefing "
+                    "written as plain spoken sentences (no markdown, lists or links)."
+                ),
+            },
+            "uninterruptible": {
+                "type": "boolean",
+                "description": (
+                    "True to deliver the opening in full even if the person starts talking "
+                    "(a briefing they asked for). Default false: they may interrupt."
+                ),
+            },
+            "hang_up_after": {
+                "type": "boolean",
+                "description": "True to end the call when the opening is done instead of taking questions.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Background to keep for follow-up questions during the call (never "
+                "spoken), such as a reference and the steps to use when the person asks for a change.",
+            },
+            "attempts": {
+                "type": "integer",
+                "description": "Only for urgent matters: how many times to ring before falling back to "
+                "text (default 1; at most 5). Each ring waits for the pause before the next.",
+            },
+            "pause_seconds": {
+                "type": "number",
+                "description": "Seconds between rings when attempts is above 1 (default 60).",
+            },
+            "topic": {
+                "type": "string",
+                "description": "Short name of what the call is about (e.g. a cron job name). "
+                "It becomes part of the call's session title.",
+            },
+            "to": {
+                "type": "string",
+                "description": "Bare JID to call. Must be an allowed user. Optional when there is only one.",
+            },
+        },
+        "required": ["opening"],
+    },
+}
+
+
+_MESSAGE_TOOL_SCHEMA = {
+    "name": "xmpp_message",
+    "description": (
+        "Send a text message over XMPP to the person or to a partner agent, for example to hand "
+        "the other agent a task. Hermes has no general send_message tool. The recipient must be "
+        "an allowed user or a partner agent. Returns whether it was sent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Bare JID of the recipient."},
+            "text": {"type": "string", "description": "The message. Plain text."},
+        },
+        "required": ["to", "text"],
+    },
+}
+
+
+def _xmpp_message_tool(args: dict, **_kw: Any) -> str:
+    """Agent tool: send a chat message through the live adapter (never a second process)."""
+
+    def result(success: bool, message: str) -> str:
+        return json.dumps({"success": success, "status": message})
+
+    adapter_ = _live_adapter()
+    if adapter_ is None or adapter_._calls_loop is None:
+        return result(False, "XMPP is not connected")
+    to = adapter_._bare(str((args or {}).get("to") or "").strip()).lower()
+    text = str((args or {}).get("text") or "").strip()
+    known = {j.lower() for j in adapter_.allowed_users} | set(adapter_._agent_peers)
+    if not text:
+        return result(False, "text is required")
+    if to not in known:
+        return result(False, f"cannot message {to or '(nobody)'}; allowed: " + ", ".join(sorted(known)))
+    with adapter_._call_tool_lock:
+        now = time.monotonic()
+        recent = [t for t in adapter_._message_tool_times.get(to, []) if now - t < 600]
+        if len(recent) >= _MESSAGE_TOOL_LIMIT:  # a confused agent must not flood a person or a peer
+            return result(False, f"too many messages to {to} in the last 10 minutes")
+        adapter_._message_tool_times[to] = recent + [now]
+    # A reply_to keeps this out of the spoken reply of a call turn (see the call host's capture()).
+    future = asyncio.run_coroutine_threadsafe(
+        adapter_.send(chat_id=to, content=text, reply_to="xmpp-message-tool"), adapter_._calls_loop
+    )
+    try:
+        sent = future.result(timeout=60)
+    except Exception as exc:
+        future.cancel()
+        return result(False, f"sending failed: {exc}")
+    return result(bool(sent.success), "sent" if sent.success else str(sent.error or "not sent"))
+
+
+def _calls_available() -> bool:
+    adapter_ = _live_adapter()
+    return adapter_ is not None and adapter_._calls is not None
+
+
+def _xmpp_connected() -> bool:
+    """`xmpp_message` is offered whenever the adapter is connected; it needs no call libraries."""
+    adapter_ = _live_adapter()
+    return adapter_ is not None and adapter_._calls_loop is not None
+
+
+def _bounded_int(value: Any, low: int, high: int) -> Optional[int]:
+    try:
+        return min(high, max(low, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _bounded_float(value: Any, low: float, high: float) -> Optional[float]:
+    try:
+        value = float(value)
+        return min(high, max(low, value)) if math.isfinite(value) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _xmpp_call_tool(args: dict, **_kw: Any) -> str:
+    """Agent tool: runs in a worker thread, so hand the call to the adapter's event loop."""
+
+    def result(success: bool, message: str) -> str:
+        return json.dumps({"success": success, "status": message})
+
+    adapter_ = _live_adapter()
+    if adapter_ is None or adapter_._calls is None or adapter_._calls_loop is None:
+        return result(False, "calls are not enabled or XMPP is not connected")
+    opening = str((args or {}).get("opening") or "").strip()
+    if not opening:
+        return result(False, "an opening line is required")
+    host = adapter_._calls_host
+    allowed = sorted(host.callable_jids() if hasattr(host, "callable_jids") else adapter_.allowed_users)
+    target = (
+        adapter_._bare(str(args.get("to") or "").strip()).lower()
+        if args.get("to") else (allowed[0] if len(allowed) == 1 else "")
+    )
+    if target and target not in allowed:
+        return result(False, f"cannot call {target}; callable people: " + ", ".join(allowed))
+    if not target:
+        return result(False, "say who to call with `to`; one of: " + ", ".join(allowed))
+    try:
+        if asyncio.get_running_loop() is adapter_._calls_loop:
+            return result(False, "cannot place a call from the XMPP event loop thread")
+    except RuntimeError:
+        pass  # no loop in this thread: the normal worker-thread case
+    if len(opening) > _OPENING_LIMIT:
+        return result(False, f"the opening is too long ({len(opening)} characters; at most {_OPENING_LIMIT})")
+    with adapter_._call_tool_lock:  # a runaway agent must not ring a person all day
+        now = time.monotonic()
+        recent = [t for t in adapter_._call_tool_times if now - t < 3600]
+        if len(recent) >= _CALL_TOOL_LIMIT:
+            return result(False, f"too many calls placed in the last hour (limit {_CALL_TOOL_LIMIT})")
+        adapter_._call_tool_times = recent + [now]
+    tries = _bounded_int(args.get("attempts"), 1, 5) or adapter_._calls_cfg["ring_attempts"]
+    pause = _bounded_float(args.get("pause_seconds"), 0.0, 3600.0)
+    asked_at, request_topic, request_context = adapter_._call_request
+    if time.monotonic() - asked_at > 600:  # only a request that is still fresh
+        request_topic = request_context = ""
+    elif not args.get("topic") or not args.get("context"):
+        adapter_._call_request = (0.0, "", "")  # used once: it does not leak into later calls
+    future = asyncio.run_coroutine_threadsafe(adapter_._calls.place_call(
+            target,
+            opening,
+            uninterruptible=_truthy(args.get("uninterruptible")),
+            hang_up_after=_truthy(args.get("hang_up_after")),
+            topic=str(args.get("topic") or request_topic)[:60],
+            context=str(args.get("context") or request_context)[:3000],
+            attempts=tries,
+            pause=pause,
+        ),
+        adapter_._calls_loop,)
+    cfg = adapter_._calls_cfg
+    patience = tries * (cfg["ring_timeout"] + (pause if pause is not None else cfg["ring_pause"]))
+    try:
+        status = future.result(timeout=patience + 2 * cfg["ring_timeout"] + 30)
+    except Exception as exc:
+        future.cancel()
+        return result(False, f"call failed: {exc}")
+    return result(status.startswith("connected"), status)
+
+
+def _calls_settings(extra: Any) -> Dict[str, Any]:
+    """`xmpp.calls` options with safe fallbacks; a bad value never stops the adapter."""
+    raw = extra.get("calls") if isinstance(extra, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    def number(key: str, default: float, kind: type, minimum: float | None = None) -> Any:
+        try:
+            value = kind(raw.get(key, default))
+            if not math.isfinite(value) or (minimum is not None and value < minimum):
+                raise ValueError("not finite or below minimum")
+            return value
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("xmpp: invalid calls.%s %r, using %r", key, raw.get(key), default)
+            return kind(default)
+
+    return {
+        "enabled": _truthy(raw.get("enabled", _scoped_getenv("XMPP_CALLS_ENABLED", "false"))),
+        "max_seconds": number("max_seconds", 600, int, 1),
+        "greeting": str(raw.get("greeting", _CALL_GREETING) or ""),
+        "filler_after": number("filler_after", 3.0, float, 0),
+        "filler": _fillers(raw.get("filler")),
+        "ring_timeout": number("ring_timeout", 60, int, 1),
+        "silence_ms": number("silence_ms", 800, int, 1),
+        "vad_level": min(3, max(0, number("vad_level", 2, int))),
+        "ack_tone": _truthy(raw.get("ack_tone", True)),
+        "allowed_users": sorted(
+            {j.strip().lower() for j in _csv(raw.get("allowed_users", "")).split(",") if j.strip()}
+        ),
+        "hangup_grace": max(0.0, number("hangup_grace", 5.0, float)),
+        "recap": _truthy(raw.get("recap", True)),
+        "idle_timeout": max(0.0, number("idle_timeout", 60.0, float)),
+        "log_transcripts": _truthy(raw.get("log_transcripts", False)),
+        "busy_wait": max(0.0, number("busy_wait", 90.0, float)),
+        "ring_attempts": min(5, max(1, number("ring_attempts", 1, int))),
+        "ring_pause": max(0.0, number("ring_pause", 60.0, float)),
+        "barge_in": "stop" if str(raw.get("barge_in", "queue")).lower() == "stop" else "queue",
+    }
+
+
 def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fillers(value: Any) -> tuple[str, ...] | None:
+    """None: not set (use the built-in phrases). Otherwise the phrases; empty means no filler."""
+    if value is None:
+        return None
+    items = value if isinstance(value, (list, tuple)) else [value]
+    phrases = tuple(p for item in items if isinstance(item, str) and (p := item.strip()))
+    if len(phrases) != len([i for i in items if i is not False]) or len(phrases) > 20:
+        logger.warning("xmpp: calls.filler takes up to 20 non-empty strings; ignoring the rest")
+    return tuple(p[:200] for p in phrases[:20])
 
 
 def _csv(value: Any) -> str:
@@ -2905,7 +3365,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     for key in (
         "jid", "password", "host", "port", "direct_tls", "connect_timeout_secs",
         "muc_rooms", "muc_nick", "allowed_users", "muc_allowed_users", "allow_all_users", "max_message_length",
-        "voice_transcription", "voice_trusted_hosts",
+        "voice_transcription", "voice_trusted_hosts", "calls", "agent_peers",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]
@@ -2973,6 +3433,19 @@ def _build_adapter(config: PlatformConfig) -> XmppAdapter:
 
 
 def register(ctx) -> None:
+    try:
+        ctx.register_tool(
+            name="xmpp_call", toolset="xmpp_calls", schema=_CALL_TOOL_SCHEMA,
+            handler=_xmpp_call_tool, check_fn=_calls_available,
+            description=_CALL_TOOL_SCHEMA["description"], emoji="📞",
+        )
+        ctx.register_tool(
+            name="xmpp_message", toolset="xmpp_calls", schema=_MESSAGE_TOOL_SCHEMA,
+            handler=_xmpp_message_tool, check_fn=_xmpp_connected,
+            description=_MESSAGE_TOOL_SCHEMA["description"], emoji="💬",
+        )
+    except Exception:  # older Hermes without plugin tools: chat still works
+        logger.debug("xmpp: could not register the xmpp tools", exc_info=True)
     ctx.register_platform(
         name="xmpp",
         label="XMPP/Jabber",
