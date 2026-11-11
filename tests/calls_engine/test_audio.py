@@ -1,7 +1,17 @@
 import numpy as np
 
 from .helpers import energy_endpointer
-from calls.audio import STT_FRAME, Endpointer, SpeechHeld, Utterance, ack_tone
+from calls.audio import (
+    MAX_TONE_S,
+    OUT_RATE,
+    STT_FRAME,
+    Endpointer,
+    SpeechHeld,
+    Utterance,
+    ack_tone,
+    load_tone,
+    wav_bytes,
+)
 
 MS = STT_FRAME // 20  # samples per ms at 16 kHz
 
@@ -66,3 +76,23 @@ def test_ack_tone_is_short_and_quiet() -> None:
     tone = ack_tone()
     assert 3000 < len(tone) < 5000  # about 80 ms at 48 kHz
     assert np.abs(tone).max() < 8000
+
+
+def test_tone_setting_builtin_off_file_cut_and_unreadable_file(tmp_path) -> None:
+    builtin = ack_tone
+
+    def length(spec: bool | str) -> int:
+        clip = load_tone(spec, builtin)
+        assert clip is not None
+        return len(clip)
+
+    assert length(True) == len(builtin())
+    assert load_tone(False, builtin) is None
+    assert load_tone("", builtin) is None
+    short = tmp_path / "chime.wav"
+    short.write_bytes(wav_bytes(np.ones(1600, np.int16), OUT_RATE))
+    assert length(str(short)) == 1600  # the file, at the call's rate
+    long = tmp_path / "long.wav"
+    long.write_bytes(wav_bytes(np.ones(OUT_RATE * (MAX_TONE_S + 3), np.int16), OUT_RATE))
+    assert length(str(long)) == OUT_RATE * MAX_TONE_S
+    assert length(str(tmp_path / "missing.wav")) == len(builtin())

@@ -146,6 +146,8 @@ multiplexed gateway read [Multiple Hermes profiles](#multiple-hermes-profiles).
 | `omemo_enabled` / `omemo.enabled` | `XMPP_OMEMO_ENABLED` | `true` | OMEMO is used only when `slixmpp-omemo` and `omemo` are installed; if enabled but missing, a warning is logged and chat is plaintext over TLS. |
 | `omemo_storage_path` / `omemo.storage_path` | `XMPP_OMEMO_STORAGE_PATH` | `<profile home>/xmpp_omemo.json` | OMEMO key file. One file per profile. |
 | `agent_peers` | `XMPP_AGENT_PEERS` | none | Partner agents (see Several agents). |
+| `agent_peer_limit` | none | `4` | Messages accepted from one partner agent per 10 minutes; the rest are dropped with a log warning. Whole number 1-1000, anything else uses the default. |
+| `message_tool_limit` | none | `10` | `xmpp_message` sends per recipient per 10 minutes. Whole number 1-1000, anything else uses the default. |
 | `disable_clarify_forms` | `XMPP_DISABLE_CLARIFY_FORMS` | `false` | Always use the numbered text clarify instead of XEP-0004 forms (`true/1/yes`). |
 | `voice_transcription` | `XMPP_VOICE_TRANSCRIPTION` | `true` | Transcribe inbound voice notes with the Hermes `stt` provider. |
 | `voice_trusted_hosts` | `XMPP_VOICE_TRUSTED_HOSTS` | the bot's domain and subdomains | Upload hosts allowed to resolve to private/LAN/tailnet addresses; `none` for no exceptions. |
@@ -367,7 +369,7 @@ agent's own thinking time. Audio only; no video.
 
 1. **Call packages** (aiortc, av, numpy, webrtcvad-wheels; Python 3.13 or newer). Nothing to
    install: with `calls.enabled` on, the first start builds an isolated Hermes environment for
-   them (about 230 MB; later starts reuse it). If the first build takes longer than 15 seconds,
+   them (about 230 MB; later starts reuse it). If the first build takes longer than 25 seconds,
    chat starts anyway and calls come with the next reconnect or gateway restart. With calls off nothing is
    downloaded or imported. See [Where the call packages live](#where-the-call-packages-live).
 2. **Providers**: `stt` and `tts` must already work in Hermes (try a voice note and a TTS reply
@@ -429,24 +431,27 @@ and `silence_ms` must be positive; `filler_after` cannot be negative. Times are 
 |---|---|---|
 | `enabled` (`XMPP_CALLS_ENABLED`) | bool, `false` | Master switch. The env var is used only when the YAML key is absent. Accepts `1/true/yes/on`. |
 | `allowed_users` | list or comma string, empty | Who may call, and be called by, the agent. Empty: every `xmpp.allowed_users` JID except `agent_peers`. Set: exactly these (they must also pass the normal chat authorization; a listed partner agent would be callable, so do not list one). With `allow_all_users: true` and this empty, nobody can call. Several people are fine; with more than one the `xmpp_call` tool needs `to`. Compared lowercase against the caller's bare JID. |
-| `max_seconds` | int, `600` | Hang up after this long, whoever is talking. |
-| `greeting` | string, `Hi, I'm here. What can I do for you?` | Spoken when someone calls the bot (incoming calls only; outgoing calls speak the `opening`). `""` for silence. |
+| `max_seconds` | int or `false`, `600` | Hang up after this long, whoever is talking. `false` lifts the limit (a silent call still ends after `idle_timeout`; set that to `0` too and a call lasts until someone hangs up). |
+| `greeting` | string or list, `Hi, I'm here. What can I do for you?` | Spoken when someone calls the bot (incoming calls only; outgoing calls speak the `opening`). Give a list and one is picked at random each call, never the same twice in a row. `""`, `[]` or `false` for silence. The whole phrase is synthesized once and kept (see [Phrase audio cache](#phrase-audio-cache)). Example: `["Hi, I'm here. What can I do for you?", "Hello! What's up?", "Yes? I'm listening.", "Hey there, go ahead.", "Hi! How can I help?", "I'm all ears. What do you need?"]`. |
 | `silence_ms` | int ms, `800` | Pause that ends your turn. Raise (1000-1500) if you get cut off while thinking; lower for snappier answers. |
 | `vad_level` | int 0-3, `2` | Noise rejection (WebRTC VAD). Higher ignores more background noise but may miss soft speech. Out-of-range values are clamped. Steady hum, fans and hiss are ignored at every level. |
-| `ack_tone` | bool, `true` | Short beep when your turn is captured. |
+| `ack_tone` | bool or file, `true` | The short beep when your turn is captured. `false` or `""` turns it off. A path plays that sound instead (see [Custom sounds](#custom-sounds)). |
+| `warn_tone` | bool or file, `true` | The two falling beeps before a planned hang-up. `false` or `""` turns them off (the `hangup_grace` wait still happens, in silence). A path plays that sound instead. |
 | `idle_timeout` | float, `60` | Seconds without anyone speaking (and no reply playing or being worked on) before the agent says goodbye and hangs up. `0` turns it off. |
 | `hangup_grace` | float, `5` | Seconds you get to speak, after two falling beeps, before a planned hang-up (a goodbye, or `hang_up_after`). Speaking cancels it. `0` hangs up at once. Negative is treated as `0`. |
 | `barge_in` | `queue` \| `stop`, `queue` | `queue`: talking while the agent speaks cuts nothing off; what you say becomes the next turn (or is steered into the running turn, see below). `stop`: your voice cuts the agent off. Any other value means `queue`. |
 | `filler_after` | float, `3.0` | Seconds of waiting for the agent before it says the `filler`. |
-| `filler` | string or list, six built-in phrases | What the agent says when it is still working after `filler_after` seconds. The built-ins are "One moment.", "Let me check.", "Working on it.", "Just a second.", "Give me a moment." and "Bear with me." Give a list to use your own; one is picked at random each time and never the same twice in a row. A single string always says that. `""` or `[]` turns it off. The audio is made once per phrase and kept in `<plugin folder>/cache/` (see [Filler audio cache](#filler-audio-cache)). |
+| `filler` | string or list, six built-in phrases | What the agent says when it is still working after `filler_after` seconds. The built-ins are "One moment.", "Let me check.", "Working on it.", "Just a second.", "Give me a moment." and "Bear with me." Give a list to use your own; one is picked at random each time and never the same twice in a row. A single string always says that. `""` or `[]` turns it off. The audio is made once per phrase and kept in `<HERMES_HOME>/cache/xmpp-calls/` (see [Phrase audio cache](#phrase-audio-cache)). |
 | `recap` | bool, `true` | After a call in which you asked for something, the agent texts you one or two sentences saying what you asked and what it did (silent if you asked for nothing). |
 | `log_transcripts` | bool, `false` | Log what was said. Off: the log only has word counts. See [Privacy](#privacy). |
 | `ring_timeout` | int, `60` | Outgoing calls: ring for up to this long. Phones stop ringing by themselves after about half a minute; the plugin rings again until this time is up (a rejection within 25 s is respected as a refusal and not re-rung; with `ring_attempts` above 1 the next attempt still rings after `ring_pause`). The same limit applies separately to the device accepting and to audio connecting. |
 | `ring_attempts` | int 1-5, `1` | Outgoing calls: how many times to ring before the message goes out as text. Out-of-range values are clamped. The agent can ask for more per call (`attempts`, urgent only). |
 | `ring_pause` | float, `60` | Seconds between rings when there are several attempts. |
 | `busy_wait` | float, `90` | An outgoing call waits this long for the current call to end instead of failing as `busy`. |
+| `max_calls_per_hour` | int 1-100, `6` | How many calls the agent may place with `xmpp_call` per hour (a runaway agent must not ring you all day). |
+| `opening_max_chars` | int 50-10000, `1500` | Longest `opening` the agent may speak when it places a call. |
 
-Negative `idle_timeout`, `busy_wait`, `ring_pause` and `hangup_grace` count as `0`. `max_seconds` is a whole number of at least 1. `greeting: null` is silence, like `""`. `filler` takes up to 20 non-empty strings of up to 200 characters; anything else is ignored with a warning, and `false` turns it off.
+Negative `idle_timeout`, `busy_wait`, `ring_pause` and `hangup_grace` count as `0`. `max_seconds` is a whole number of at least 1 or `false`. `greeting: null` is silence, like `""`. `greeting` takes up to 20 non-empty strings of up to 500 characters and `filler` up to 20 of up to 200; anything else is ignored with a warning, and `false` turns either off. `max_calls_per_hour` and `opening_max_chars` are clamped to their range.
 
 Fixed, not configurable: one call at a time, DTLS-SRTP required, Opus the only codec,
 ICE-UDP the only transport. Audio/video and multiple-content offers are refused; this plugin
@@ -465,8 +470,8 @@ Jingle initiation without a preceding proposal is supported (Dino uses this path
 
 | Sound | Meaning |
 |---|---|
-| One short beep | It heard you finish speaking and is sending your turn to the agent. Any noise the voice detector takes for speech also gets one, even if the transcript turns out empty. |
-| Two falling beeps | The agent is about to hang up (after a goodbye or with `hang_up_after`). Speak within `hangup_grace` seconds to keep the call open. Only recognised words count: room noise that the voice detector takes for speech does not cancel the hang-up (with `barge_in: queue`). |
+| One short beep (`ack_tone`) | It heard you finish speaking and is sending your turn to the agent. Any noise the voice detector takes for speech also gets one, even if the transcript turns out empty. |
+| Two falling beeps (`warn_tone`) | The agent is about to hang up (after a goodbye or with `hang_up_after`). Speak within `hangup_grace` seconds to keep the call open. Only recognised words count: room noise that the voice detector takes for speech does not cancel the hang-up (with `barge_in: queue`). |
 | "One moment." (spoken) | The agent is still working after `filler_after` seconds. |
 
 Short transcripts that are only a stock phrase such as "Thank you." or "Thanks for watching" are treated
@@ -491,15 +496,34 @@ Playback applies backpressure before synthesizing further sentences: about five 
 queued audio plus the next atomic sentence. A very long sentence can exceed that target.
 Failure to synthesize the optional filler does not discard the agent's actual answer.
 
-### Filler audio cache
+### Phrase audio cache
 
-The first time a phrase is needed, it is synthesized and saved as
-`<HERMES_HOME>/cache/xmpp-calls/filler-<hash of the phrase>.npy` (one file per phrase; `HERMES_HOME`
+The first time a phrase is needed (a `filler` or a `greeting`), it is synthesized and saved as
+`<HERMES_HOME>/cache/xmpp-calls/phrase-<hash of the phrase>.npy` (one file per phrase; `HERMES_HOME`
 is the active profile's home, so each profile has its own cache). Later calls (and restarts) play
 that file without asking the TTS provider. Changing the phrases makes new files. **If you change the bot's voice
-or TTS provider, delete the `cache/xmpp-calls/` folder**; the next slow answer regenerates the filler in
-the new voice. A damaged, empty or oversized file is ignored and regenerated. Only the filler is cached; other
-speech is synthesized per call.
+or TTS provider, delete the `cache/xmpp-calls/` folder**; the next call regenerates the phrases in
+the new voice. A damaged, empty or oversized file is ignored and regenerated. Only fillers and greetings are
+cached; other speech is synthesized per call. If synthesis fails, a greeting is spoken the normal way
+(and posted as text when that fails too); a failed filler is skipped.
+
+### Custom sounds
+
+`ack_tone` and `warn_tone` take a path to any audio file PyAV can read (WAV, OGG, MP3, ...). `~`
+and absolute paths work; a relative path is looked up in the Hermes home. It is resampled to 48 kHz
+mono and cut at 5 seconds. A file that cannot be read logs `cannot read the sound ...` and the built-in
+beep is used instead. No sounds ship with the plugin, so make or download your own, for example a
+short chime: `ffmpeg -f lavfi -i "sine=frequency=1200:duration=0.15" ~/.hermes/chime.wav`
+(PyAV is only a binding to FFmpeg's libraries and carries no sound library, but FFmpeg's `sine`
+source above makes any tone you like).
+`false` or `""` turns a sound off entirely.
+
+```yaml
+xmpp:
+  calls:
+    ack_tone: ~/.hermes/sounds/chime.wav   # your file instead of the built-in beep
+    warn_tone: false                       # no falling beeps (the hangup_grace wait stays, silent)
+```
 
 **Hanging up does not cancel what you asked.** If you hang up in the middle of a request, or the
 time limit ends the call, the plugin still transcribes what you were saying, lets the agent finish
@@ -558,7 +582,10 @@ keeps running after the tool returns.
 
 `xmpp_message`: `to` (an allowed user or a partner agent) and `text`, sent through the running
 adapter (never a second process). At most
-10 messages per recipient per 10 minutes (then `too many messages to ...`).
+10 messages per recipient per 10 minutes, or `xmpp.message_tool_limit` (then `too many messages to ...`).
+Hermes itself has no model-callable send tool (its `send_message` helper is for cron and the CLI and
+sends through a short-lived second connection that never uses OMEMO), so this is the only way for an
+agent to message someone, encrypted, on its own.
 
 Example cron prompt ending: *"When the job is done, call me with xmpp_call: tell me the top
 options you considered, why you chose the one you published, and read me today's note.
@@ -575,9 +602,14 @@ JIDs, also `XMPP_AGENT_PEERS`). Rules:
 - A partner agent can message the agent but is never called and can never call (unless you put it
   in `calls.allowed_users`, which you should not).
 - Because two agents that answer each other never stop, messages from a partner are limited to 4
-  per 10 minutes (the rest are dropped with a log warning). The gateway's own status lines (tool
-  progress, "interrupting", the silence-marker warning; lines starting with ⚡ Interrupting, ⚙, 📞,
-  ⏳, 💭, 🔧, ⏩, 🔄, 💾) are neither sent to nor acted on from a partner.
+  per 10 minutes, or `xmpp.agent_peer_limit` (the rest are dropped with a log warning). The gateway's own status
+  lines are neither sent to nor acted on from a partner: lines starting with ⚡ Interrupting, ⚙, 📞,
+  ⏳, 💭, 🔧, ⏩, 🔄, 💾, ⏸, 💡, 🔁, 🗜, 📦 or "♻️ Gateway", and the transient warnings the gateway writes while
+  a turn is still retrying ("I seem to be stuck", "No response from provider", "trying fallback",
+  "Retrying in", "This conversation is paused", ...). A real result or warning written by the agent
+  passes, even with a ⚠️ or ❌ in front. Tool-progress lines start with a different emoji per tool, so
+  they cannot be recognised reliably: **give partner profiles `display.tool_progress: off`**, or the
+  other agent receives a message per tool call.
 - The agent is told the sender is a machine and to reply exactly `[SILENT]` when nothing needs doing.
 
 **Two-profile example** (a phone agent that talks to you and a worker that runs cron jobs; each
@@ -641,6 +673,7 @@ phone and from the bot's host; on a Tailscale network that is an ACL matter (see
 | Dino (Linux) | Incoming and outgoing calls tested with the bot. Sends no RTP while muted (handled). Silently skips a resource that does not advertise Jingle RTP; the bot advertises it after login. |
 | Conversations (Android) | Incoming and outgoing calls tested with the bot. Needs mutual presence for the call button. |
 | Monal (iOS) | Calls with the bot and voice messages tested. Needs mutual presence for the call button. |
+| Monocles Chat (Android) | Incoming calls to the bot tested. |
 | Others (Gajim, etc.) | Untested. The bot speaks Jingle Message Initiation (XEP-0353) and Jingle RTP with ICE-UDP, DTLS-SRTP and Opus; a client offering those may work, none of the others has been tried. |
 
 #### Privacy
@@ -666,11 +699,11 @@ phone and from the bot's host; on a Tailscale network that is an ACL matter (see
 | What | Limit |
 |---|---|
 | Concurrent calls | 1 per adapter (a second caller hears busy) |
-| Call length | `max_seconds` (600) |
+| Call length | `max_seconds` (600, `false` for none) |
 | Spoken turn | waits at most 180 s for the agent |
-| Partner agent → this agent | 4 messages / 10 min |
-| `xmpp_message` | 10 / recipient / 10 min |
-| `xmpp_call` | 6 calls / hour; `opening` at most 1500 chars; `attempts` 1-5, `pause_seconds` 0-3600, `topic` 60 chars, `context` 3000 chars; the tool waits for the whole ring schedule plus the connect time |
+| Partner agent → this agent | 4 messages / 10 min (`agent_peer_limit`) |
+| `xmpp_message` | 10 / recipient / 10 min (`message_tool_limit`) |
+| `xmpp_call` | 6 calls / hour (`max_calls_per_hour`); `opening` at most 1500 chars (`opening_max_chars`); `attempts` 1-5, `pause_seconds` 0-3600, `topic` 60 chars, `context` 3000 chars; the tool waits for the whole ring schedule plus the connect time |
 | Call that never connects | ended after 40 s; a call whose ICE/DTLS fails mid-call is ended at once |
 | Remote ICE candidates | UDP to a public/private unicast address, port 1024-65535, at most 16 per call; loopback, link-local, multicast and host names are ignored. Values that carry whitespace or control characters are refused |
 | Codec / transport | Opus, ICE-UDP, DTLS-SRTP only; audio only |
@@ -691,7 +724,7 @@ First look in the gateway log. Lines to know: `xmpp: audio calls enabled`, `call
 | **Voice reply silent, or text appears in chat instead** | TTS failed (`speech synthesis failed; sending the rest as text`): fix the `tts` provider. Nothing in chat either and `TTS also failed; staying silent`: provider down. The agent answered `[SILENT]`/empty: the host nudges once, then says nothing; check the model/prompt. Empty `greeting` is silent by design. |
 | **STT empty: agent never answers, or "heard no words"** | `heard no words in a N s utterance`: noise, a stock phrase dropped as a phantom, or STT returned nothing. `transcription failed` / `STT failed:` : the `stt` provider is not configured or erroring. Lower `vad_level`, raise `silence_ms`, or check the microphone (Dino sends nothing while muted). |
 | **Cut off mid-sentence / hears background noise** | Raise `silence_ms` (1000-1500) / raise `vad_level`. |
-| **Hangs up by itself** | `idle_timeout` (60 s of quiet), `max_seconds` (600), or the agent said goodbye (two falling beeps, then `hangup_grace`). |
+| **Hangs up by itself** | `idle_timeout` (60 s of quiet), `max_seconds` (600, unless `false`), or the agent said goodbye (two falling beeps, then `hangup_grace`). |
 | **Agent has no `xmpp_call` tool** | Enable toolset `xmpp_calls` for the gateway/cron job; the tools appear only while the adapter is connected with calls enabled. |
 | **OMEMO `NoEligibleDevices` on recap / missed-call text** | The bot has no device list for the person. Open the person's OMEMO-capable client once and have them send a message. Note the fallback: after an encryption failure the bot sends that text **unencrypted** and logs `OMEMO: encryption failed for ..., sending plaintext`. |
 

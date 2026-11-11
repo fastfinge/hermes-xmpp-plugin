@@ -408,14 +408,31 @@ def _find_omemo_plugin(client: Any) -> Any:
 # Adapter
 # ----------------------------------------------------------------
 
+# Defaults of limits that settings can change (xmpp.agent_peer_limit, xmpp.message_tool_limit,
+# xmpp.calls.max_calls_per_hour, xmpp.calls.opening_max_chars).
 _AGENT_PEER_LIMIT = 4  # messages per 10 minutes accepted from one partner agent
 _MESSAGE_TOOL_LIMIT = 10  # xmpp_message sends per recipient per 10 minutes
 _CALL_TOOL_LIMIT = 6  # xmpp_call placements per hour
 _OPENING_LIMIT = 1500  # characters an agent may speak when it places a call
 # Gateway status lines ("⚡ Interrupting...", "⚙️ tool_search...") the other agent's gateway
 # sends as chat; answering them would keep two agents talking forever.
-_NOTICE_PREFIXES = ("⚡ Interrupting", "⚙", "📞", "⏳", "💭", "🔧", "⏩", "🔄", "💾")
-_NOTICE_PHRASES = ("returned only a silence marker",)  # the gateway's reply to a bare [SILENT]
+_NOTICE_PREFIXES = (
+    "⚡ Interrupting", "⚙", "📞", "⏳", "💭", "🔧", "⏩", "🔄", "💾",
+    "⏸", "💡", "🔁", "🗜", "📦", "♻️ Gateway",  # paused, first-time tips, compaction, restart
+)
+# Transient gateway warnings: the partner's turn is still running or retrying, so there is nothing
+# to act on yet. Real warnings written by an agent ("⚠️ Disk is almost full") still pass.
+_NOTICE_PHRASES = (
+    "returned only a silence marker",  # the gateway's reply to a bare [SILENT]
+    "I seem to be stuck", "No response from provider", "No first stream event",
+    "Model returning empty", "Empty response from model", "Empty/malformed response",
+    "trying fallback", "switching to fallback", "Provider unreachable",
+    "Provider temporarily unavailable", "Turn aborted by the liveness watchdog",
+    "This turn stopped making progress", "Stream interrupted mid tool-call",
+    "Retrying in", "Retrying API call", "Primary model restored", "Model fallback:",
+    "Tool guardrail halted", "Hermes is restarting", "This conversation is paused",
+    "Your message is saved and will be answered",
+)
 
 
 def _is_gateway_notice(text: str) -> bool:
@@ -638,6 +655,8 @@ class XmppAdapter(BasePlatformAdapter):
             for j in _csv(extra.get("agent_peers", _scoped_getenv("XMPP_AGENT_PEERS", ""))).split(",")
             if j.strip()
         )
+        self._agent_peer_limit: int = _bounded_int(extra.get("agent_peer_limit"), 1, 1000) or _AGENT_PEER_LIMIT
+        self._message_tool_limit: int = _bounded_int(extra.get("message_tool_limit"), 1, 1000) or _MESSAGE_TOOL_LIMIT
         self._agent_peer_times: Dict[str, List[float]] = {}
         self._message_tool_times: Dict[str, List[float]] = {}
         self._call_tool_times: List[float] = []
@@ -897,7 +916,7 @@ class XmppAdapter(BasePlatformAdapter):
         except RuntimeError:
             self._calls_loop = None
 
-    async def _await_call_packages(self, timeout: float = 15.0) -> None:
+    async def _await_call_packages(self, timeout: float = 25.0) -> None:
         """Give the call packages a short head start. The first start downloads ~230 MB, and the
         gateway gives connect() 30 s, so a slow build continues in its thread while chat starts;
         calls come with the next reconnect or restart."""
@@ -938,7 +957,7 @@ class XmppAdapter(BasePlatformAdapter):
             )
             config = controller.CallConfig(
                 max_seconds=self._calls_cfg["max_seconds"],
-                greeting=self._calls_cfg["greeting"],
+                greetings=self._calls_cfg["greeting"],
                 filler_after=self._calls_cfg["filler_after"],
                 **({"fillers": self._calls_cfg["filler"]} if self._calls_cfg["filler"] is not None else {}),
                 filler_cache=Path(_hermes_home()) / "cache" / "xmpp-calls",
@@ -946,6 +965,7 @@ class XmppAdapter(BasePlatformAdapter):
                 silence_ms=self._calls_cfg["silence_ms"],
                 vad_level=self._calls_cfg["vad_level"],
                 ack_tone=self._calls_cfg["ack_tone"],
+                warn_tone=self._calls_cfg["warn_tone"],
                 barge_in=self._calls_cfg["barge_in"],
                 hangup_grace=self._calls_cfg["hangup_grace"],
                 recap=self._calls_cfg["recap"],
@@ -982,12 +1002,12 @@ class XmppAdapter(BasePlatformAdapter):
 
     def _agent_peer_may_speak(self, peer: str) -> bool:
         """Loop guard: two agents that answer each other never stop. Accept at most
-        `_AGENT_PEER_LIMIT` messages per 10 minutes from a partner agent; drop the rest."""
+        `agent_peer_limit` messages per 10 minutes from a partner agent; drop the rest."""
         now = time.monotonic()
         recent = self._agent_peer_times.setdefault(peer, [])
         recent[:] = [t for t in recent if now - t < 600]
-        if len(recent) >= _AGENT_PEER_LIMIT:
-            logger.warning("xmpp: dropping message from agent peer %s (over %d per 10 min)", peer, _AGENT_PEER_LIMIT)
+        if len(recent) >= self._agent_peer_limit:
+            logger.warning("xmpp: dropping message from agent peer %s (over %d per 10 min)", peer, self._agent_peer_limit)
             return False
         recent.append(now)
         return True
@@ -3031,7 +3051,7 @@ def _xmpp_message_tool(args: dict, **_kw: Any) -> str:
     with adapter_._call_tool_lock:
         now = time.monotonic()
         recent = [t for t in adapter_._message_tool_times.get(to, []) if now - t < 600]
-        if len(recent) >= _MESSAGE_TOOL_LIMIT:  # a confused agent must not flood a person or a peer
+        if len(recent) >= adapter_._message_tool_limit:  # a confused agent must not flood a person or a peer
             return result(False, f"too many messages to {to} in the last 10 minutes")
         adapter_._message_tool_times[to] = recent + [now]
     # A reply_to keeps this out of the spoken reply of a call turn (see the call host's capture()).
@@ -3099,13 +3119,15 @@ def _xmpp_call_tool(args: dict, **_kw: Any) -> str:
             return result(False, "cannot place a call from the XMPP event loop thread")
     except RuntimeError:
         pass  # no loop in this thread: the normal worker-thread case
-    if len(opening) > _OPENING_LIMIT:
-        return result(False, f"the opening is too long ({len(opening)} characters; at most {_OPENING_LIMIT})")
+    opening_limit = adapter_._calls_cfg["opening_max_chars"]
+    if len(opening) > opening_limit:
+        return result(False, f"the opening is too long ({len(opening)} characters; at most {opening_limit})")
     with adapter_._call_tool_lock:  # a runaway agent must not ring a person all day
         now = time.monotonic()
         recent = [t for t in adapter_._call_tool_times if now - t < 3600]
-        if len(recent) >= _CALL_TOOL_LIMIT:
-            return result(False, f"too many calls placed in the last hour (limit {_CALL_TOOL_LIMIT})")
+        call_limit = adapter_._calls_cfg["max_calls_per_hour"]
+        if len(recent) >= call_limit:
+            return result(False, f"too many calls placed in the last hour (limit {call_limit})")
         adapter_._call_tool_times = recent + [now]
     tries = _bounded_int(args.get("attempts"), 1, 5) or adapter_._calls_cfg["ring_attempts"]
     pause = _bounded_float(args.get("pause_seconds"), 0.0, 3600.0)
@@ -3152,14 +3174,17 @@ def _calls_settings(extra: Any) -> Dict[str, Any]:
 
     return {
         "enabled": _truthy(raw.get("enabled", _scoped_getenv("XMPP_CALLS_ENABLED", "false"))),
-        "max_seconds": number("max_seconds", 600, int, 1),
-        "greeting": str(raw.get("greeting", _CALL_GREETING) or ""),
+        "max_seconds": _max_seconds(raw.get("max_seconds", 600), number),
+        "greeting": (_phrases(raw["greeting"], "greeting", 500) or ()) if "greeting" in raw else (_CALL_GREETING,),
         "filler_after": number("filler_after", 3.0, float, 0),
-        "filler": _fillers(raw.get("filler")),
+        "filler": _phrases(raw.get("filler"), "filler", 200),
         "ring_timeout": number("ring_timeout", 60, int, 1),
         "silence_ms": number("silence_ms", 800, int, 1),
         "vad_level": min(3, max(0, number("vad_level", 2, int))),
-        "ack_tone": _truthy(raw.get("ack_tone", True)),
+        "ack_tone": _tone(raw.get("ack_tone", True)),
+        "warn_tone": _tone(raw.get("warn_tone", True)),
+        "max_calls_per_hour": min(100, max(1, number("max_calls_per_hour", _CALL_TOOL_LIMIT, int))),
+        "opening_max_chars": min(10000, max(50, number("opening_max_chars", _OPENING_LIMIT, int))),
         "allowed_users": sorted(
             {j.strip().lower() for j in _csv(raw.get("allowed_users", "")).split(",") if j.strip()}
         ),
@@ -3178,15 +3203,38 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _fillers(value: Any) -> tuple[str, ...] | None:
-    """None: not set (use the built-in phrases). Otherwise the phrases; empty means no filler."""
+def _phrases(value: Any, key: str, chars: int) -> tuple[str, ...] | None:
+    """None: not set. Otherwise up to 20 phrases (a string or a list); empty means none."""
     if value is None:
         return None
     items = value if isinstance(value, (list, tuple)) else [value]
     phrases = tuple(p for item in items if isinstance(item, str) and (p := item.strip()))
     if len(phrases) != len([i for i in items if i is not False]) or len(phrases) > 20:
-        logger.warning("xmpp: calls.filler takes up to 20 non-empty strings; ignoring the rest")
-    return tuple(p[:200] for p in phrases[:20])
+        logger.warning("xmpp: calls.%s takes up to 20 non-empty strings; ignoring the rest", key)
+    return tuple(p[:chars] for p in phrases[:20])
+
+
+def _max_seconds(value: Any, number: Any) -> int | None:
+    """`false` (or off/none/no) lifts the time limit; anything else is the usual number."""
+    if value is None:
+        return 600  # not a number and not "off": the default
+    if value is False or str(value).strip().lower() in ("false", "off", "none", "no"):
+        return None
+    return number("max_seconds", 600, int, 1) if value is not True else 600
+
+
+def _tone(value: Any) -> bool | str:
+    """True: the built-in beep. False, "" or off: none. Anything else is a sound file path
+    (a relative one is looked up in the Hermes home)."""
+    if value is None or value is True:
+        return True
+    text = str(value).strip()
+    if text.lower() in ("true", "yes", "on", "1"):
+        return True
+    if value is False or text.lower() in ("", "false", "no", "off", "none", "0"):
+        return False
+    path = os.path.expanduser(text)
+    return path if os.path.isabs(path) else os.path.join(_hermes_home(), path)
 
 
 def _csv(value: Any) -> str:
@@ -3365,7 +3413,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     for key in (
         "jid", "password", "host", "port", "direct_tls", "connect_timeout_secs",
         "muc_rooms", "muc_nick", "allowed_users", "muc_allowed_users", "allow_all_users", "max_message_length",
-        "voice_transcription", "voice_trusted_hosts", "calls", "agent_peers",
+        "voice_transcription", "voice_trusted_hosts", "calls", "agent_peers", "agent_peer_limit", "message_tool_limit",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]

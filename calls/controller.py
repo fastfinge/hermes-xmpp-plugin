@@ -17,8 +17,8 @@ from xml.etree import ElementTree as ET
 from slixmpp.exceptions import IqError, XMPPError
 
 from . import turn
-from .audio import Endpointer, webrtc_vad
-from .conversation import FILLERS, Conversation, Speech
+from .audio import Endpointer, ack_tone, load_tone, warn_tone, webrtc_vad
+from .conversation import FILLERS, Conversation, Speech, choose
 from .jingle import wire
 from .jingle.model import JINGLE, RTP, Candidate, Jingle, JingleError
 from .jingle.sdp import MAX_CANDIDATES
@@ -44,6 +44,7 @@ RECAP_PROMPT = (
     "asked for or wanted changed during the call and what you did about it. If they asked for "
     "nothing, reply exactly NONE.]"
 )
+TICK_S = 10.0  # how often a running call checks its limits (tests shorten it)
 CONNECT_LIMIT = 40.0  # a call whose media is not up after this long is dead
 IDLE_GOODBYE = "I do not hear anyone, so I am hanging up. Call me back any time."
 CLIENT_RING_LIMIT = 25.0  # a "reject" after ringing this long is the phone timing out
@@ -78,8 +79,8 @@ class Host(Protocol):
 
 @dataclass(frozen=True)
 class CallConfig:
-    max_seconds: int = 600
-    greeting: str = "Hi, I'm here. What can I do for you?"
+    max_seconds: int | None = 600  # None: no limit
+    greetings: tuple[str, ...] = ("Hi, I'm here. What can I do for you?",)  # one at random; () off
     filler_after: float = 3.0
     fillers: tuple[str, ...] = FILLERS  # one is said at random when the agent is slow; () is off
     filler_cache: Path | None = None  # where its audio is kept between calls (None: not kept)
@@ -91,7 +92,8 @@ class CallConfig:
     vad_level: int = (
         2  # WebRTC VAD aggressiveness 0-3: higher rejects more noise, misses soft speech
     )
-    ack_tone: bool = True  # short beep when an utterance is captured
+    ack_tone: bool | str = True  # beep when an utterance is captured: False, or a sound file
+    warn_tone: bool | str = True  # two falling beeps before a planned hang-up: False, or a file
     hangup_grace: float = 5.0  # warning beeps, then this long to speak before a planned hang-up
     busy_wait: float = 90.0  # outgoing calls wait this long for the current call to end
     idle_timeout: float = 60.0  # nobody has spoken for this long: say goodbye and hang up (0: off)
@@ -150,6 +152,7 @@ class CallController:
         self._pending: dict[str, Pending] = {}
         self._closed = asyncio.Event()
         self._proposals: dict[tuple[str, str], str] = {}
+        self._last_greeting = ""
         self._missed: dict[str, str] = {}  # peer -> text sent instead of a call nobody answered
 
     # ---- wiring -------------------------------------------------------------------------
@@ -480,7 +483,8 @@ class CallController:
             endpointer=Endpointer(
                 silence_ms=config.silence_ms, is_speech=webrtc_vad(config.vad_level)
             ),
-            ack_tone_enabled=config.ack_tone,
+            ack_clip=load_tone(config.ack_tone, ack_tone),
+            warn_clip=load_tone(config.warn_tone, warn_tone),
             fallback_text=lambda text: self.host.post_text(bare, text),
             barge_in=config.barge_in,
             hangup_grace=config.hangup_grace,
@@ -722,16 +726,17 @@ class CallController:
 
     async def _greet(self, call: Call) -> None:
         await call.media.connected.wait()
-        if self.config.greeting:
-            await call.convo.say(self.config.greeting)
+        if self.config.greetings:
+            self._last_greeting = choose(self.config.greetings, self._last_greeting)
+            await call.convo.say(self._last_greeting, cached=True)
 
     async def _limit(self, sid: str) -> None:
         """Enforce the call time limit; meanwhile log RTP counts every 10 s (is audio flowing?)."""
         loop = asyncio.get_running_loop()
         started = loop.time()
-        deadline = started + self.config.max_seconds
-        while (left := deadline - loop.time()) > 0:
-            await asyncio.sleep(min(10, left))
+        deadline = started + self.config.max_seconds if self.config.max_seconds else None
+        while deadline is None or (left := deadline - loop.time()) > 0:
+            await asyncio.sleep(TICK_S if deadline is None else min(TICK_S, left))
             call = self.calls.get(sid)
             if call is not None:
                 logging.info("calls: %s rtp received/sent %s", sid[:8], await call.media.packets())

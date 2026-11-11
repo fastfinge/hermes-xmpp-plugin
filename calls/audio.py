@@ -3,6 +3,8 @@
 import asyncio
 import fractions
 import io
+import logging
+import os
 import time
 import wave
 from collections.abc import Callable
@@ -176,6 +178,24 @@ def decode_to_out_rate(path: str) -> np.ndarray:
             chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(frame)]
     chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(None)]
     return np.concatenate(chunks) if chunks else np.zeros(0, np.int16)
+
+
+MAX_TONE_S = 5  # a custom sound longer than this is cut
+
+
+def load_tone(spec: bool | str, builtin: Callable[[], np.ndarray]) -> np.ndarray | None:
+    """True: the built-in beep. False or "": no sound. A path: that audio file (anything PyAV
+    reads), cut at MAX_TONE_S. A file that cannot be read falls back to the built-in beep."""
+    if spec is True:
+        return builtin()
+    if not spec:
+        return None
+    try:
+        clip = decode_to_out_rate(os.path.expanduser(spec))[: OUT_RATE * MAX_TONE_S]
+    except Exception:
+        logging.warning("calls: cannot read the sound %s; using the built-in beep", spec)
+        return builtin()
+    return clip if clip.size else builtin()
 
 
 class PlaybackTrack(MediaStreamTrack):

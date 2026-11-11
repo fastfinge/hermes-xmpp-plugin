@@ -54,33 +54,25 @@ def test_offer_parses_in_aiortc(name: str) -> None:
     assert media.rtcp_mux
 
 
-def test_dino_drops_component_2_and_sdes() -> None:
-    text = sdp.offer_to_sdp(load("dino-session-initiate.xml"))
-    assert text.count("a=candidate:") == 4
-    assert "crypto" not in text
-    assert "a=mid:audio" in text
-    assert "BUNDLE" not in text
+def test_each_clients_offer_keeps_what_it_needs() -> None:
+    dino = sdp.offer_to_sdp(load("dino-session-initiate.xml"))
+    assert dino.count("a=candidate:") == 4  # component 2 dropped
+    assert "crypto" not in dino
+    assert "a=mid:audio" in dino
+    assert "BUNDLE" not in dino
+    conversations = sdp.offer_to_sdp(load("conversations-session-initiate.xml"))
+    assert "a=group:BUNDLE 0" in conversations
+    assert "a=mid:0" in conversations
+    assert "useinbandfec=1" in conversations
 
 
-def test_conversations_keeps_bundle_and_name() -> None:
-    text = sdp.offer_to_sdp(load("conversations-session-initiate.xml"))
-    assert "a=group:BUNDLE 0" in text
-    assert "a=mid:0" in text
-    assert "useinbandfec=1" in text
-
-
-def test_refuses_unencrypted_offer() -> None:
+def test_offers_without_encryption_or_opus_are_refused() -> None:
     offer = load("dino-session-initiate.xml")
     (content,) = offer.contents
     assert content.transport is not None
     bare = replace(content, transport=replace(content.transport, fingerprint=None))
     with pytest.raises(SecurityError):
         sdp.offer_to_sdp(replace(offer, contents=(bare,)))
-
-
-def test_refuses_offer_without_opus() -> None:
-    offer = load("dino-session-initiate.xml")
-    (content,) = offer.contents
     no_opus = replace(content, payloads=tuple(p for p in content.payloads if p.name != "opus"))
     with pytest.raises(UnsupportedError):
         sdp.offer_to_sdp(replace(offer, contents=(no_opus,)))
@@ -186,12 +178,12 @@ def test_boolean_fmtp_values_become_numbers_aiortc_accepts() -> None:
     SessionDescription.parse(text)  # the real aiortc parser used to raise ValueError here
 
 
-@pytest.mark.parametrize("name", ["x=1;stereo", "", "a b", "\uff58"])
-def test_fmtp_names_that_could_split_or_inject_are_refused(name: str) -> None:
+def test_fmtp_names_that_could_split_or_inject_are_refused() -> None:
     offer = load("conversations-session-initiate.xml")
     (content,) = offer.contents
     opus = next(p for p in content.payloads if p.name.lower() == "opus")
-    bad = replace(opus, parameters=((name, "1"),))
-    payloads = tuple(bad if p is opus else p for p in content.payloads)
-    with pytest.raises(JingleError):
-        sdp.offer_to_sdp(replace(offer, contents=(replace(content, payloads=payloads),)))
+    for name in ("x=1;stereo", "", "a b", "\uff58"):
+        bad = replace(opus, parameters=((name, "1"),))
+        payloads = tuple(bad if p is opus else p for p in content.payloads)
+        with pytest.raises(JingleError):
+            sdp.offer_to_sdp(replace(offer, contents=(replace(content, payloads=payloads),)))

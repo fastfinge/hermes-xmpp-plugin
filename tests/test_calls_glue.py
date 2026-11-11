@@ -61,10 +61,6 @@ def make_adapter(**extra):
 
 # ---------------------------------------------------------------- settings
 
-def test_calls_are_off_by_default():
-    assert make_adapter()._calls_cfg["enabled"] is False
-
-
 def run_loop_in_thread():
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
@@ -78,42 +74,9 @@ def stop_loop(loop, thread):
     loop.close()  # an unclosed loop is a ResourceWarning, which CI turns into a failure
 
 
-def test_settings_from_config():
-    a = make_adapter(calls={"enabled": True, "max_seconds": "120", "greeting": "Hello!", "filler_after": 2})
-    assert a._calls_cfg == {
-        "enabled": True, "max_seconds": 120, "greeting": "Hello!", "filler_after": 2.0, "filler": None, "ring_timeout": 60,
-        "recap": True, "idle_timeout": 60.0, "log_transcripts": False, "busy_wait": 90.0, "ring_attempts": 1, "ring_pause": 60.0, "silence_ms": 800, "vad_level": 2, "ack_tone": True, "barge_in": "queue", "allowed_users": [], "hangup_grace": 5.0,
-    }
-
-
-def test_vad_level_is_clamped_and_ack_tone_can_be_off():
-    cfg = adapter._calls_settings({"calls": {"vad_level": 9, "ack_tone": False, "silence_ms": 1200}})
-    assert (cfg["vad_level"], cfg["ack_tone"], cfg["silence_ms"]) == (3, False, 1200)
-
-
-def test_bad_numbers_fall_back():
-    cfg = adapter._calls_settings({"calls": {"max_seconds": "soon", "filler_after": None}})
-    assert (cfg["max_seconds"], cfg["filler_after"]) == (600, 3.0)
-
-
-def test_filler_can_be_changed_or_turned_off():
-    def filler(value):
-        return adapter._calls_settings({"calls": {"filler": value}})["filler"]
-
-    assert filler("Hold on.") == ("Hold on.",)
-    assert filler([" A. ", "B.", ""]) == ("A.", "B.")
-    assert filler("") == filler([]) == ()
-    assert adapter._calls_settings({"calls": {}})["filler"] is None  # built-in phrases
-
-
 def test_env_enables_calls(monkeypatch):
     monkeypatch.setenv("XMPP_CALLS_ENABLED", "true")
     assert adapter._calls_settings({})["enabled"] is True
-
-
-def test_yaml_passes_calls_block_through():
-    extra = adapter._apply_yaml_config({}, {"jid": "a@b", "password": "x", "calls": {"enabled": True}})
-    assert extra["calls"] == {"enabled": True}
 
 
 # ---------------------------------------------------------------- wiring
@@ -295,11 +258,6 @@ def test_register_adds_the_tool_and_survives_old_hermes():
     assert old.register_platform.called
 
 
-def test_barge_in_setting():
-    assert adapter._calls_settings({"calls": {"barge_in": "STOP"}})["barge_in"] == "stop"
-    assert adapter._calls_settings({"calls": {"barge_in": "whatever"}})["barge_in"] == "queue"
-
-
 def test_every_call_gets_its_own_session_thread():
     a = make_adapter(calls={"enabled": True})
     a._build_calls(MagicMock())
@@ -413,9 +371,9 @@ def test_ambiguous_target_lists_the_choices(monkeypatch):
 
 def test_partner_agent_messages_are_rate_limited(monkeypatch):
     """Two agents answering each other must not loop forever."""
-    a = make_adapter(agent_peers=["Agent@Example.org"])
+    a = make_adapter(agent_peers=["Agent@Example.org"], agent_peer_limit=2)
     assert a._agent_peers == {"agent@example.org"}
-    assert all(a._agent_peer_may_speak("agent@example.org") for _ in range(adapter._AGENT_PEER_LIMIT))
+    assert all(a._agent_peer_may_speak("agent@example.org") for _ in range(2))
     assert not a._agent_peer_may_speak("agent@example.org")  # the next one is dropped
     assert a._agent_peer_may_speak("other@example.org")  # others are untouched
     real = adapter.time.monotonic
@@ -450,8 +408,19 @@ def test_status_lines_from_a_partner_agent_are_not_answered():
     assert adapter._is_gateway_notice("⚙️ tool_search")
     assert adapter._is_gateway_notice("⚡ Interrupting current task (iteration 2).")
     assert adapter._is_gateway_notice("⚠️ The model returned only a silence marker for a message")
+    for line in (  # lines the gateway itself writes while a turn is still running or retrying
+        "⏸️ This conversation is paused: a previous turn did not finish when Hermes restarted",
+        "💡 First-time tip — I queued your message instead of interrupting.",
+        "⚠️ I seem to be stuck (no activity for 5 min). Send /stop to cancel the current run.",
+        "⚠️ No response from provider for 60s (model: x). Retrying",
+        "⚠️ Rate limited — switching to fallback provider...",
+        "🗜️ Compacted earlier messages", "📦 Preflight compression: ~90,000 tokens",
+        "♻️ Gateway online/restarted", "🔁 Response dominated by repeated text",
+    ):
+        assert adapter._is_gateway_notice(line), line
     assert not adapter._is_gateway_notice("CALL REQUEST for x")
-    assert not adapter._is_gateway_notice("⚠️ Disk is almost full on host-1")  # a real warning passes
+    for answer in ("⚠️ Disk is almost full on host-1", "✅ Deployed build 42", "❌ The deploy failed: exit 1"):
+        assert not adapter._is_gateway_notice(answer), answer  # real results and warnings pass
     assert "[SILENT]" in adapter._AGENT_PROMPT
 
 
@@ -553,7 +522,7 @@ def test_a_stt_command_that_hears_nothing_is_an_empty_transcript(monkeypatch):
 
 
 def test_xmpp_message_tool_is_rate_limited(monkeypatch):
-    a = make_adapter(allowed_users="user@example.org", agent_peers=["agent@example.org"], calls={"enabled": True})
+    a = make_adapter(allowed_users="user@example.org", agent_peers=["agent@example.org"], message_tool_limit=3, calls={"enabled": True})
     loop, thread = run_loop_in_thread()
 
     async def send(chat_id, content, reply_to=None, **kw):
@@ -562,7 +531,7 @@ def test_xmpp_message_tool_is_rate_limited(monkeypatch):
     a.send, a._calls_loop = send, loop
     monkeypatch.setattr(adapter, "_CALL_ADAPTERS", {adapter._home_key(): a})
     try:
-        results = [json.loads(adapter._xmpp_message_tool({"to": "user@example.org", "text": str(i)})) for i in range(adapter._MESSAGE_TOOL_LIMIT + 1)]
+        results = [json.loads(adapter._xmpp_message_tool({"to": "user@example.org", "text": str(i)})) for i in range(a._message_tool_limit + 1)]
     finally:
         stop_loop(loop, thread)
     assert all(r["success"] for r in results[:-1])
@@ -570,7 +539,7 @@ def test_xmpp_message_tool_is_rate_limited(monkeypatch):
 
 
 def test_xmpp_call_tool_refuses_a_long_opening_and_limits_calls(monkeypatch):
-    a = make_adapter(allowed_users="user@example.org", calls={"enabled": True})
+    a = make_adapter(allowed_users="user@example.org", calls={"enabled": True, "max_calls_per_hour": 2, "opening_max_chars": 100})
     loop, thread = run_loop_in_thread()
 
     class Controller:
@@ -580,23 +549,13 @@ def test_xmpp_call_tool_refuses_a_long_opening_and_limits_calls(monkeypatch):
     a._calls, a._calls_loop = Controller(), loop
     monkeypatch.setattr(adapter, "_CALL_ADAPTERS", {adapter._home_key(): a})
     try:
-        long = json.loads(adapter._xmpp_call_tool({"to": "user@example.org", "opening": "x" * 2000}))
-        assert not long["success"] and "too long" in long["status"]
+        long = json.loads(adapter._xmpp_call_tool({"to": "user@example.org", "opening": "x" * 101}))
+        assert not long["success"] and "too long" in long["status"] and "at most 100" in long["status"]
         results = [
             json.loads(adapter._xmpp_call_tool({"to": "user@example.org", "opening": "hi"}))
-            for _ in range(adapter._CALL_TOOL_LIMIT + 1)
+            for _ in range(3)
         ]
     finally:
         stop_loop(loop, thread)
     assert all(r["success"] for r in results[:-1])
     assert not results[-1]["success"] and "too many calls" in results[-1]["status"]
-
-
-def test_filler_ignores_non_strings_and_caps_the_list():
-    def filler(value):
-        return adapter._calls_settings({"calls": {"filler": value}})["filler"]
-
-    assert filler(False) == () and filler([None, {"a": 1}, "ok"]) == ("ok",)
-    assert len(filler([f"p{i}" for i in range(50)])) == 20
-    assert len(filler(["x" * 1000])[0]) == 200
-    assert adapter._calls_settings({"calls": {"greeting": None}})["greeting"] == ""

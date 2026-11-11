@@ -23,8 +23,6 @@ from .audio import (
     PlaybackTrack,
     SpeechHeld,
     Utterance,
-    ack_tone,
-    warn_tone,
 )
 from .speech import is_phantom, sentences, split_hangup
 
@@ -37,8 +35,13 @@ FILLERS = (
     "Give me a moment.",
     "Bear with me.",
 )
-MAX_FILLER_BYTES = 20_000_000  # a cached phrase is a few hundred kB; refuse anything absurd
+MAX_CLIP_BYTES = 20_000_000  # a cached phrase is a few hundred kB; refuse anything absurd
 GAP_S = 0.1  # no RTP for this long: the clock, not packets, advances endpointing
+
+
+def choose(options: tuple[str, ...], last: str) -> str:
+    """A random phrase, never the same one twice in a row (unless it is the only one)."""
+    return random.choice([p for p in options if p != last] or list(options))
 
 
 class Speech(Protocol):
@@ -91,7 +94,8 @@ class Conversation:
         fillers: tuple[str, ...] = FILLERS,
         filler_cache: Path | None = None,
         endpointer: Endpointer | None = None,
-        ack_tone_enabled: bool = True,
+        ack_clip: np.ndarray | None = None,  # played when an utterance is captured
+        warn_clip: np.ndarray | None = None,  # played before a planned hang-up
         fallback_text: Callable[[str], Awaitable[None]] | None = None,
         barge_in: str = "queue",
         hangup_grace: float = 5.0,
@@ -113,11 +117,11 @@ class Conversation:
         self._background: set[asyncio.Task[None]] = set()
         self.speech, self.respond, self.on_hangup = speech, respond, on_hangup
         self.fallback_text = fallback_text  # gets the reply as text when speaking it fails
-        self._ack = ack_tone() if ack_tone_enabled else None
+        self._ack, self._warn = ack_clip, warn_clip
         self.filler_after = filler_after  # seconds of waiting for the agent before the filler
         self.fillers = fillers  # one is picked at random each time; () turns it off
         self.filler_cache = filler_cache  # directory holding the filler audio between calls
-        self._filler_audio: dict[str, np.ndarray] = {}  # phrase -> audio, for this call
+        self._clips: dict[str, np.ndarray] = {}  # phrase -> audio, for this call
         self._last_filler = ""
         self._cache: dict[
             str, asyncio.Future[np.ndarray]
@@ -178,28 +182,31 @@ class Conversation:
         self._prep.add_done_callback(self._background.discard)
 
     async def _filler_clip(self) -> np.ndarray:
-        """A random filler (never the same twice in a row), played from this call's memory or the
+        """A random filler, never the same twice in a row."""
+        self._last_filler = choose(self.fillers, self._last_filler)
+        return await self._clip(self._last_filler)
+
+    async def _clip(self, phrase: str) -> np.ndarray:
+        """The audio of a phrase said often (filler, greeting): from this call's memory or the
         cache directory, else synthesized once and saved. The cache file name carries the phrase,
         so changing the phrases makes new files."""
-        choices = [p for p in self.fillers if p != self._last_filler] or list(self.fillers)
-        phrase = self._last_filler = random.choice(choices)
-        if phrase in self._filler_audio:
-            return self._filler_audio[phrase]
+        if phrase in self._clips:
+            return self._clips[phrase]
         path = None
         if self.filler_cache is not None:
             digest = hashlib.sha256(phrase.encode()).hexdigest()[:12]
-            path = self.filler_cache / f"filler-{digest}.npy"
+            path = self.filler_cache / f"phrase-{digest}.npy"
             if (clip := await asyncio.to_thread(self._load_clip, path)) is not None:
-                return self._filler_audio.setdefault(phrase, clip)
+                return self._clips.setdefault(phrase, clip)
         clip = await self._synth(phrase)
         if path is not None:
             await asyncio.to_thread(self._save_clip, path, clip)
-        return self._filler_audio.setdefault(phrase, clip)
+        return self._clips.setdefault(phrase, clip)
 
     @staticmethod
     def _load_clip(path: Path) -> np.ndarray | None:
         try:
-            if path.stat().st_size > MAX_FILLER_BYTES:
+            if path.stat().st_size > MAX_CLIP_BYTES:
                 return None
             with open(path, "rb") as handle:  # np.load would leave a .npz archive open
                 clip = np.load(handle, allow_pickle=False)
@@ -220,7 +227,7 @@ class Conversation:
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
         except OSError:
-            logging.warning("calls: could not save the filler audio to %s", path)
+            logging.warning("calls: could not save the phrase audio to %s", path)
             if tmp is not None:
                 with suppress(OSError):
                     os.unlink(tmp)
@@ -242,13 +249,25 @@ class Conversation:
             f"them this instead: {text}] "
         )
 
-    async def say(self, text: str, *, protected: bool = False) -> None:
+    async def say(self, text: str, *, protected: bool = False, cached: bool = False) -> None:
         """Speak without a turn (greeting, outgoing-call opening). With `protected`, the caller
-        cannot interrupt: their speech is ignored until `text` has been played in full."""
+        cannot interrupt: their speech is ignored until `text` has been played in full. With
+        `cached`, the whole text is one clip kept like a filler (a phrase said call after call)."""
         self._protected = protected
         self.touch()
         try:
-            await self._speak(Turn(sentences(text), self.playback.played))
+            clip = None
+            if cached:
+                try:
+                    clip = await self._clip(text)
+                except Exception:
+                    logging.exception("cached phrase failed; speaking it the normal way")
+            if clip is not None and not self.closed:
+                self._turn = Turn([text], self.playback.played)
+                self._turn.samples.append(len(clip))
+                self.playback.play(clip)
+            else:
+                await self._speak(Turn(sentences(text), self.playback.played))
             if protected:
                 await self.playback.wait_idle()
         finally:
@@ -269,7 +288,8 @@ class Conversation:
         self._spoke.clear()
         while not self._utterances.empty():
             self._utterances.get_nowait()
-        self.playback.play(warn_tone())
+        if self._warn is not None:
+            self.playback.play(self._warn)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + seconds
         while True:
@@ -349,7 +369,7 @@ class Conversation:
         self.playback.flush()
         self._queued.clear()
         self._turn = self._turn_pcm = None
-        self._filler_audio = {}
+        self._clips = {}
         self._endpointer.reset()
         for future in self._cache.values():
             if future.done() and not future.cancelled():

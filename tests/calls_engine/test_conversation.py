@@ -11,7 +11,7 @@ import pytest
 from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 
 from .helpers import energy_endpointer
-from calls.audio import OUT_FRAME, OUT_RATE
+from calls.audio import OUT_FRAME, OUT_RATE, ack_tone, warn_tone
 from calls.conversation import FILLERS, Conversation, Turn
 
 
@@ -84,7 +84,6 @@ async def test_turn_is_transcribed_answered_and_spoken() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("quiet", 200), ("talk", 1000), ("quiet", 1000)]))
     await settle(convo)
@@ -109,7 +108,6 @@ async def test_empty_transcript_makes_no_turn() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
     await settle(convo)
@@ -132,7 +130,6 @@ async def test_hangup_marker_is_not_spoken_and_ends_call() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
         hangup_grace=0,
     )
     convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
@@ -159,7 +156,6 @@ async def test_barge_in_flushes_audio_and_notes_heard_fraction() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
     await settle(convo)
@@ -197,7 +193,6 @@ async def test_muted_client_still_ends_the_utterance() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 1000)], stall=True))
     await asyncio.sleep(1.8)
@@ -222,7 +217,6 @@ async def test_slow_agent_gets_a_filler() -> None:
         filler_after=0.05,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
     await settle(convo)
@@ -257,7 +251,6 @@ async def test_pause_mid_thought_is_joined_not_forgotten() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 600), ("quiet", 900), ("talk", 600), ("quiet", 1000)]))
     await settle(convo)
@@ -280,6 +273,7 @@ async def test_utterance_end_plays_the_ack_tone() -> None:
         endpointer=energy_endpointer(),
         barge_in="stop",
         filler_after=60,
+        ack_clip=ack_tone(),
     )
     convo.attach(Caller([("talk", 800), ("quiet", 1000)]))
     await settle(convo)
@@ -310,7 +304,6 @@ async def test_failed_speech_falls_back_to_text() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
         fallback_text=post,
     )
     convo.attach(Caller([("talk", 800), ("quiet", 1000)]))
@@ -456,7 +449,6 @@ async def test_queue_mode_does_not_cut_the_agent_off_and_answers_afterwards() ->
         respond,
         lambda: asyncio.sleep(0),
         endpointer=energy_endpointer(),
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 800), ("quiet", 1000)]))
     await settle(convo)
@@ -494,7 +486,6 @@ async def test_queue_mode_steers_a_turn_that_is_still_thinking() -> None:
         FakeSpeech("start the report"),
         respond,
         lambda: asyncio.sleep(0),
-        ack_tone_enabled=False,
         steer=steer,
     )
     await convo._hear(np.ones(16000, np.int16))  # starts the turn
@@ -509,7 +500,6 @@ async def test_queue_mode_steers_a_turn_that_is_still_thinking() -> None:
 
 @pytest.mark.asyncio
 async def test_planned_hangup_warns_and_waits_for_speech() -> None:
-    from calls.audio import warn_tone
 
     async def respond(text: str) -> str:
         return "x"
@@ -517,7 +507,7 @@ async def test_planned_hangup_warns_and_waits_for_speech() -> None:
     async def hangup() -> None:
         pass
 
-    convo = Conversation(FakeSpeech(), respond, hangup)
+    convo = Conversation(FakeSpeech(), respond, hangup, warn_clip=warn_tone())
     assert await convo.grace(0.1) is False  # nobody spoke: time to hang up
     assert len(convo.playback._buf) == len(warn_tone())  # the warning beeps were queued
     loop = asyncio.get_running_loop()
@@ -543,7 +533,6 @@ async def test_goodbye_waits_out_the_grace_time_before_hanging_up() -> None:
         hangup,
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
         hangup_grace=0.4,
     )
     convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
@@ -566,9 +555,7 @@ async def test_calling_back_after_a_missed_call_tells_the_agent() -> None:
     async def hangup() -> None:
         pass
 
-    convo = Conversation(
-        FakeSpeech(), respond, hangup, endpointer=energy_endpointer(), ack_tone_enabled=False
-    )
+    convo = Conversation(FakeSpeech(), respond, hangup, endpointer=energy_endpointer())
     convo.remember_missed("Your backup finished.")
     convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
     await settle(convo)
@@ -618,7 +605,6 @@ async def test_hanging_up_mid_request_still_gets_the_request_handled() -> None:
         respond,
         hangup,
         endpointer=energy_endpointer(),
-        ack_tone_enabled=False,
         fallback_text=post,
         filler_after=0.05,
     )
@@ -649,7 +635,6 @@ async def test_hanging_up_while_still_talking_handles_what_was_said() -> None:
         respond,
         hangup,
         endpointer=energy_endpointer(),
-        ack_tone_enabled=False,
         fallback_text=post,
     )
     convo.attach(Caller([("talk", 800)], stall=True))  # still speaking when the line drops
@@ -694,7 +679,6 @@ async def test_what_was_said_stays_out_of_the_log_unless_asked(caplog) -> None:
         respond,
         hangup,
         endpointer=energy_endpointer(),
-        ack_tone_enabled=False,
     )
     convo.attach(Caller([("talk", 600), ("quiet", 1000)]))
     await settle(convo)
@@ -705,7 +689,6 @@ async def test_what_was_said_stays_out_of_the_log_unless_asked(caplog) -> None:
         respond,
         hangup,
         endpointer=energy_endpointer(),
-        ack_tone_enabled=False,
         log_text=True,
     )
     convo2.attach(Caller([("talk", 600), ("quiet", 1000)]))
@@ -740,7 +723,6 @@ def _filler_convo(speech, tmp_path, fillers=("One moment.",)):
         filler_cache=tmp_path / "cache",
         endpointer=energy_endpointer(),
         barge_in="stop",
-        ack_tone_enabled=False,
     )
 
 
@@ -752,22 +734,7 @@ async def test_filler_audio_is_made_once_and_reused_across_calls(tmp_path) -> No
         convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
         await settle(convo)
         assert speech.spoken.count("One moment.") == (1 if _ == 0 else 0)
-    assert len(list((tmp_path / "cache").glob("filler-*.npy"))) == 1
-
-
-@pytest.mark.asyncio
-async def test_damaged_filler_file_is_made_again(tmp_path) -> None:
-    speech = FakeSpeech()
-    convo = _filler_convo(speech, tmp_path)
-    convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
-    await settle(convo)
-    (path,) = (tmp_path / "cache").glob("filler-*.npy")
-    path.write_bytes(b"not an array")
-    again = FakeSpeech()
-    convo = _filler_convo(again, tmp_path)
-    convo.attach(Caller([("talk", 1000), ("quiet", 1000)]))
-    await settle(convo)
-    assert again.spoken[0] == "One moment."
+    assert len(list((tmp_path / "cache").glob("phrase-*.npy"))) == 1
 
 
 @pytest.mark.asyncio
@@ -789,7 +756,7 @@ async def test_fillers_are_picked_at_random_and_never_repeat_back_to_back(tmp_pa
     assert all(a != b for a, b in itertools.pairwise(picks))
     # each phrase was synthesized once and saved
     assert sorted(speech.spoken) == ["Hold on.", "Let me see.", "One moment."]
-    assert len(list((tmp_path / "cache").glob("filler-*.npy"))) == 3
+    assert len(list((tmp_path / "cache").glob("phrase-*.npy"))) == 3
 
 
 async def _pick(convo) -> str:
@@ -801,19 +768,20 @@ async def _pick(convo) -> str:
     "damage",
     [
         b"",
+        b"not an array",
         b"PK\x03\x04 not an npy",
         b"\x93NUMPY\x01\x00v\x00{'descr': '<i2', 'fortran_order': False, 'shape': (2**60,), }"
         + b" " * 20
         + b"\n",
     ],
-    ids=["empty", "zip", "absurd-shape"],
+    ids=["empty", "text", "zip", "absurd-shape"],
 )
 @pytest.mark.asyncio
 async def test_any_damaged_filler_file_is_replaced(tmp_path, damage) -> None:
     speech = FakeSpeech()
     convo = _filler_convo(speech, tmp_path)
     await convo._filler_clip()
-    (path,) = (tmp_path / "cache").glob("filler-*.npy")
+    (path,) = (tmp_path / "cache").glob("phrase-*.npy")
     path.write_bytes(damage)
     again = FakeSpeech()
     convo = _filler_convo(again, tmp_path)
@@ -821,6 +789,36 @@ async def test_any_damaged_filler_file_is_replaced(tmp_path, damage) -> None:
     assert again.spoken == ["One moment."]
     assert Conversation._load_clip(path) is not None  # rewritten, no temp files left
     assert [p.name for p in (tmp_path / "cache").iterdir()] == [path.name]
+
+
+@pytest.mark.asyncio
+async def test_greeting_is_one_cached_clip_and_a_dead_tts_falls_back_to_text(tmp_path) -> None:
+    text = "Hi there. How can I help?"
+    speech = FakeSpeech()
+    convo = _filler_convo(speech, tmp_path)
+    await convo.say(text, cached=True)
+    assert speech.spoken == [text]  # one clip for the whole greeting, not one per sentence
+    assert convo._turn is not None
+    assert len(convo.playback._buf) == OUT_RATE
+    assert convo._turn.parts == [text]
+    again = FakeSpeech()
+    await _filler_convo(again, tmp_path).say(text, cached=True)
+    assert again.spoken == []  # second call: read from the cache file
+    assert len(list((tmp_path / "cache").glob("phrase-*.npy"))) == 1
+
+    class BrokenTTS(FakeSpeech):
+        async def synthesize(self, text: str) -> np.ndarray:
+            raise RuntimeError("tts down")
+
+    posted: list[str] = []
+
+    async def post(text: str) -> None:
+        posted.append(text)
+
+    convo = _filler_convo(BrokenTTS(), tmp_path / "other")
+    convo.fallback_text = post
+    await convo.say("Hello again.", cached=True)
+    assert posted == ["Hello again."]
 
 
 @pytest.mark.asyncio

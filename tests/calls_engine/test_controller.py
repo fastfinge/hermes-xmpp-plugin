@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import itertools
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ import slixmpp
 from slixmpp.exceptions import IqError
 
 from .helpers import make_offer
+from calls import controller
 from calls.controller import JMI, CallConfig, CallController
 from calls.jingle import wire
 from calls.jingle.model import Jingle
@@ -255,16 +257,110 @@ async def _run_outgoing(**options: Any) -> tuple[CallController, FakeClient, str
 
 
 @pytest.mark.asyncio
-async def test_outgoing_call_rings_offers_and_speaks_the_opening() -> None:
-    ctl, _, result, phone, spoken = await _run_outgoing()
+async def test_outgoing_call_rings_offers_speaks_the_opening_names_the_session_and_recaps() -> None:
+    ctl, _, result, phone, spoken = await _run_outgoing(topic="example-daily-note")
     sid = next(iter(ctl.calls))
     assert result.startswith("connected")
     await asyncio.sleep(0.1)
     assert "Your backup finished." in spoken
     assert "began by saying: Your backup finished." in ctl.calls[sid].convo._note
     assert not ctl.calls[sid].convo._protected
+    (title,) = ctl.host.titles  # type: ignore[attr-defined]
+    assert re.fullmatch(r"Call to alice \d{4}-\d\d-\d\d \d\d:\d\d example-daily-note", title)
+    ctl.calls[sid].convo.turns = 2  # the person said something and the agent answered
+    await ctl.end(sid, "success", notify=True)
+    await asyncio.sleep(0.2)
+    recaps = [t for _, t in ctl.host.texts if t.startswith("Call recap:")]  # type: ignore[attr-defined]
+    assert len(recaps) == 1
+    await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_call_without_talk_has_no_recap_and_a_plain_title() -> None:
+    ctl, _, _, phone, _ = await _run_outgoing()
+    sid = next(iter(ctl.calls))
+    await asyncio.sleep(0.1)
+    (title,) = ctl.host.titles  # type: ignore[attr-defined]
+    assert re.fullmatch(r"Call to alice \d{4}-\d\d-\d\d \d\d:\d\d", title)
+    await ctl.end(sid, "success", notify=True)
+    await asyncio.sleep(0.2)
+    assert ctl.host.texts == []  # type: ignore[attr-defined]
+    await phone.close()
+
+
+async def _limited_call(
+    monkeypatch: Any, **config: Any
+) -> tuple[CallController, str, list[str], Any]:
+    monkeypatch.setattr(controller, "TICK_S", 0.05)
+    ctl, _, _, phone, spoken = await _run_outgoing()
+    sid = next(iter(ctl.calls))
+    ctl.config = CallConfig(**config)
+    ctl.calls[sid].convo.playback.flush()
+    return ctl, sid, spoken, phone
+
+
+async def _wait_until_gone(ctl: CallController, sid: str) -> None:
+    for _ in range(400):  # the goodbye is 3 s of audio that drains in real time
+        if sid not in ctl.calls:
+            return
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_an_idle_call_says_goodbye_and_ends_even_without_a_time_limit(
+    monkeypatch: Any,
+) -> None:
+    ctl, sid, spoken, phone = await _limited_call(monkeypatch, idle_timeout=0.2, max_seconds=None)
+    ctl.calls[sid].convo.last_active -= 5
+    task = asyncio.create_task(ctl._limit(sid))
+    await _wait_until_gone(ctl, sid)
+    task.cancel()
+    assert sid not in ctl.calls
+    assert any("hanging up" in s for s in spoken)
+    await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_the_call_ends_at_max_seconds_and_no_limit_means_no_end(monkeypatch: Any) -> None:
+    ctl, sid, spoken, phone = await _limited_call(monkeypatch, idle_timeout=0, max_seconds=0.3)
+    await asyncio.wait_for(ctl._limit(sid), 5)  # returns once the limit ended the call
+    assert sid not in ctl.calls
+    assert not any("hanging up" in s for s in spoken)  # cut at the limit, not idle
+    await phone.close()
+
+    ctl, sid, _, phone = await _limited_call(monkeypatch, idle_timeout=0, max_seconds=None)
+    task = asyncio.create_task(ctl._limit(sid))
+    await asyncio.sleep(0.5)  # ten ticks: any deadline would have fired
+    assert sid in ctl.calls
+    assert not task.done()
+    task.cancel()
     await ctl.close()
     await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_greeting_is_one_of_the_phrases_spoken_cached_and_never_twice_in_a_row() -> None:
+    ctl, _ = make()
+    said: list[tuple[str, bool]] = []
+
+    async def say(text: str, *, cached: bool = False) -> None:
+        said.append((text, cached))
+
+    connected = asyncio.Event()
+    connected.set()
+    call = SimpleNamespace(
+        media=SimpleNamespace(connected=connected), convo=SimpleNamespace(say=say)
+    )
+    ctl.config = CallConfig(greetings=("Hello.", "Hi there.", "Yes?"))
+    for _ in range(30):
+        await ctl._greet(call)  # type: ignore[arg-type]
+    assert {text for text, _ in said} == {"Hello.", "Hi there.", "Yes?"}
+    assert all(a[0] != b[0] for a, b in itertools.pairwise(said))
+    assert all(c for _, c in said)
+    said.clear()
+    ctl.config = CallConfig(greetings=())  # off
+    await ctl._greet(call)  # type: ignore[arg-type]
+    assert said == []
 
 
 @pytest.mark.asyncio
@@ -374,45 +470,6 @@ async def _record(spoken: list[str], text: str) -> np.ndarray:
 
 
 @pytest.mark.asyncio
-async def test_call_session_gets_a_recognizable_title() -> None:
-    ctl, _, _, phone, _ = await _run_outgoing()
-    await asyncio.sleep(0.1)
-    (title,) = ctl.host.titles  # type: ignore[attr-defined]
-    assert re.fullmatch(r"Call to alice \d{4}-\d\d-\d\d \d\d:\d\d", title)
-    await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_call_title_includes_the_topic() -> None:
-    ctl, _, _, phone, _ = await _run_outgoing(topic="example-daily-note")
-    await asyncio.sleep(0.1)
-    assert ctl.host.titles[0].endswith(" example-daily-note")  # type: ignore[attr-defined]
-    await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_call_with_talk_ends_with_a_text_recap() -> None:
-    ctl, _, _, phone, _ = await _run_outgoing()
-    sid = next(iter(ctl.calls))
-    ctl.calls[sid].convo.turns = 2  # the person said something and the agent answered
-    await ctl.end(sid, "success", notify=True)
-    await asyncio.sleep(0.2)
-    recaps = [t for _, t in ctl.host.texts if t.startswith("Call recap:")]  # type: ignore[attr-defined]
-    assert len(recaps) == 1
-    await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_call_without_talk_has_no_recap() -> None:
-    ctl, _, _, phone, _ = await _run_outgoing()
-    sid = next(iter(ctl.calls))
-    await ctl.end(sid, "success", notify=True)
-    await asyncio.sleep(0.2)
-    assert ctl.host.texts == []  # type: ignore[attr-defined]
-    await phone.close()
-
-
-@pytest.mark.asyncio
 async def test_outgoing_call_to_someone_already_on_a_call_is_said_there() -> None:
     ctl, client, _, phone, spoken = await _run_outgoing()
     before = len(client.sent)
@@ -463,24 +520,6 @@ async def test_hanging_up_does_not_cancel_the_agents_work() -> None:
     await asyncio.sleep(0.8)
     assert done.is_set()
     assert ("alice@example.org", "All done.") in ctl.host.texts  # type: ignore[attr-defined]
-    await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_an_idle_call_says_goodbye_and_ends() -> None:
-    ctl, _, _, phone, spoken = await _run_outgoing()
-    sid = next(iter(ctl.calls))
-    ctl.config = CallConfig(idle_timeout=0.2, max_seconds=30)
-    ctl.calls[sid].convo.last_active -= 5
-    ctl.calls[sid].convo.playback.flush()
-    task = asyncio.create_task(ctl._limit(sid))
-    for _ in range(80):
-        if sid not in ctl.calls:
-            break
-        await asyncio.sleep(0.25)
-    task.cancel()
-    assert sid not in ctl.calls
-    assert any("hanging up" in s for s in spoken)
     await phone.close()
 
 

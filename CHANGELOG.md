@@ -11,6 +11,14 @@ All notable changes to this project will be documented in this file.
 - `xmpp.calls.filler`: the "One moment." filler is now a string or list (six built-in phrases,
   picked at random, never twice in a row; `""` turns it off). Each phrase is synthesized once and
   kept in `<HERMES_HOME>/cache/xmpp-calls/`. Calls need Python 3.13 or newer.
+- `xmpp.calls.greeting` takes a string or a list too (one at random, never twice in a row) and is
+  cached like a filler. `ack_tone` and the new `warn_tone` (the two falling beeps) accept `false`,
+  `""` or a sound file. `max_seconds: false` lifts the time limit. New limits with unchanged
+  defaults: `xmpp.calls.max_calls_per_hour` (6), `xmpp.calls.opening_max_chars` (1500),
+  `xmpp.agent_peer_limit` (4 per 10 minutes) and `xmpp.message_tool_limit` (10 per recipient per
+  10 minutes).
+- More gateway status lines are recognised and not exchanged with a partner agent (paused, first-time
+  tips, compaction, restart, retry and fallback warnings).
 - `xmpp.calls.allowed_users` and `xmpp.calls.hangup_grace` (warning beeps and a speaking
   window before a planned hang-up).
 

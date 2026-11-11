@@ -38,7 +38,6 @@ async def make_conversation():
             respond,
             kwargs.pop("on_hangup", lambda: asyncio.sleep(0)),
             endpointer=energy_endpointer(),
-            ack_tone_enabled=False,
             filler_after=kwargs.pop("filler_after", 999),
             **kwargs,
         )
