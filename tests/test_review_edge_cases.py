@@ -222,6 +222,11 @@ def test_call_settings_defaults_overrides_and_garbage():
     check("defaults", (defaults["greeting"], defaults["ack_tone"], defaults["warn_tone"], defaults["max_seconds"],
                        defaults["max_calls_per_hour"], defaults["opening_max_chars"]),
           (("Hi, I'm here. What can I do for you?",), True, True, 600, 6, 1500))
+    check(
+        "session defaults",
+        (defaults["session"], defaults["session_rotate"], defaults["session_title"]),
+        ("per_call", "never", ""),
+    )
     check("adapter uses them", make_adapter()._calls_cfg, defaults)
     peer_defaults = make_adapter()
     check("peer limits", (peer_defaults._agent_peer_limit, peer_defaults._message_tool_limit), (4, 10))
@@ -231,6 +236,17 @@ def test_call_settings_defaults_overrides_and_garbage():
     check("clamp", (cfg["vad_level"], cfg["silence_ms"]), (3, 1200))
     check("barge_in", [setting("barge_in", v) for v in ("STOP", "whatever")], ["stop", "queue"])
     check("bad words", (setting("max_seconds", "soon"), setting("filler_after", None)), (600, 3.0))
+    for value, want in [("per_peer", "per_peer"), (" PER_CALL ", "per_call"), ("chat", "per_call"), (None, "per_call"), (5, "per_call")]:
+        check(f"session={value!r}", setting("session", value), want)
+    for value, want in [
+        ("weekly", "weekly"),
+        (" Monthly ", "monthly"),
+        ("hourly", "never"),
+        (None, "never"),
+    ]:
+        check(f"session_rotate={value!r}", setting("session_rotate", value), want)
+    for value, want in [(None, ""), ("  Calls   with {name}\n", "Calls with {name}"), ("x" * 500, "x" * 200)]:
+        check(f"session_title={value!r}", setting("session_title", value), want)
     for value, want in [("Hi.", ("Hi.",)), ([" A. ", "B.", ""], ("A.", "B.")), ("", ()), ([], ()), (None, ()), (False, ())]:
         check(f"greeting={value!r}", setting("greeting", value), want)
     check("greeting list is capped", len(setting("greeting", [f"g{i}" for i in range(50)])), 20)

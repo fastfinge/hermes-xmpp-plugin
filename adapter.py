@@ -1030,7 +1030,10 @@ class XmppAdapter(BasePlatformAdapter):
             host_module = import_module(f"{base}.hermes_host")
             client.register_plugin("xep_0115")
             self._calls_host = host_module.HermesCallHost(
-                self, frozenset(self._calls_cfg["allowed_users"])
+                self,
+                frozenset(self._calls_cfg["allowed_users"]),
+                self._calls_cfg["session"],
+                self._calls_cfg["session_rotate"],
             )
             config = controller.CallConfig(
                 max_seconds=self._calls_cfg["max_seconds"],
@@ -1043,6 +1046,8 @@ class XmppAdapter(BasePlatformAdapter):
                 vad_level=self._calls_cfg["vad_level"],
                 ack_tone=self._calls_cfg["ack_tone"],
                 warn_tone=self._calls_cfg["warn_tone"],
+                session=self._calls_cfg["session"],
+                session_title=self._calls_cfg["session_title"],
                 barge_in=self._calls_cfg["barge_in"],
                 hangup_grace=self._calls_cfg["hangup_grace"],
                 recap=self._calls_cfg["recap"],
@@ -3292,6 +3297,14 @@ def _calls_settings(extra: Any) -> Dict[str, Any]:
         "ring_timeout": number("ring_timeout", 60, int, 1),
         "silence_ms": number("silence_ms", 800, int, 1),
         "vad_level": min(3, max(0, number("vad_level", 2, int))),
+        "session": _choice(raw.get("session"), ("per_call", "per_peer"), "per_call", "session"),
+        "session_rotate": _choice(
+            raw.get("session_rotate"),
+            ("never", "daily", "weekly", "monthly"),
+            "never",
+            "session_rotate",
+        ),
+        "session_title": " ".join(str(raw.get("session_title") or "").split())[:200],
         "ack_tone": _tone(raw.get("ack_tone", True)),
         "warn_tone": _tone(raw.get("warn_tone", True)),
         "max_calls_per_hour": min(100, max(1, number("max_calls_per_hour", _CALL_TOOL_LIMIT, int))),
@@ -3332,6 +3345,15 @@ def _max_seconds(value: Any, number: Any) -> int | None:
     if value is False or str(value).strip().lower() in ("false", "off", "none", "no"):
         return None
     return number("max_seconds", 600, int, 1) if value is not True else 600
+
+
+def _choice(value: Any, allowed: tuple[str, ...], default: str, key: str) -> str:
+    """One of `allowed` (case-insensitive); anything else warns and uses the default."""
+    text = str(value if value is not None else default).strip().lower()
+    if text in allowed:
+        return text
+    logger.warning("xmpp: invalid calls.%s %r (one of %s), using %r", key, value, ", ".join(allowed), default)
+    return default
 
 
 def _tone(value: Any) -> bool | str:

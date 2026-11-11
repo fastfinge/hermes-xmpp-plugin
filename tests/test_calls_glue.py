@@ -260,11 +260,87 @@ def test_register_adds_the_tool_and_survives_old_hermes():
     assert old.register_platform.called
 
 
-def test_every_call_gets_its_own_session_thread():
+def test_session_mode_decides_the_thread_a_call_runs_in():
     a = make_adapter(calls={"enabled": True})
     a._build_calls(MagicMock())
     source = a._calls_host._source("user@example.org", "sid42")
     assert (source.chat_id, source.chat_type, source.thread_id) == ("user@example.org", "dm", "call-sid42")
+    a = make_adapter(calls={"enabled": True, "session": "per_peer", "session_title": "Calls {name}"})
+    controller = a._build_calls(MagicMock())
+    for call_id in ("sid1", "sid2"):  # every call of the person shares one session
+        assert a._calls_host._source("user@example.org", call_id).thread_id == "calls"
+    assert controller.config.session == "per_peer"
+    assert controller.config.session_title == "Calls {name}"
+
+
+def test_per_peer_rotation_puts_the_period_in_the_thread_and_pins_it_per_call(monkeypatch):
+    import datetime as real
+
+    clock = [real.datetime(2026, 11, 12, 23, 59)]
+
+    clock_module = types.SimpleNamespace(now=lambda: clock[0])
+
+    def thread(rotate, call_id, session="per_peer"):
+        a = make_adapter(calls={"enabled": True, "session": session, "session_rotate": rotate})
+        a._build_calls(MagicMock())
+        monkeypatch.setattr(sys.modules[type(a._calls_host).__module__], "datetime", clock_module)
+        return a._calls_host, a._calls_host._source("user@example.org", call_id).thread_id
+
+    for rotate, want in [
+        ("never", "calls"),
+        ("daily", "calls-2026-11-12"),
+        ("weekly", "calls-2026-W46"),
+        ("monthly", "calls-2026-11"),
+    ]:
+        assert thread(rotate, "a")[1] == want
+    assert thread("daily", "a", session="per_call")[1] == "call-a"  # rotation is per_peer only
+    host, first = thread("daily", "late")
+    clock[0] = real.datetime(2026, 11, 13, 0, 1)  # the call runs past midnight
+    assert host._source("user@example.org", "late").thread_id == first  # same session
+    assert host._source("user@example.org", "next").thread_id == "calls-2026-11-13"
+
+
+def test_a_call_session_is_titled_once_and_with_a_title_hermes_has_not_taken(monkeypatch):
+    class Db:
+        def __init__(self, titles):
+            self.titles = titles  # session id -> title
+
+        async def get_session_title(self, session_id):
+            return self.titles.get(session_id)
+
+        async def get_next_title_in_lineage(self, base):
+            taken = [t for t in self.titles.values() if t and t.split(" #")[0] == base]
+            return f"{base} #{len(taken) + 1}" if taken else base
+
+    class Store:
+        async def get_or_create_session(self, source):
+            return types.SimpleNamespace(session_id="s-now")
+
+    sessions = types.SimpleNamespace(
+        SessionDB=types.SimpleNamespace(sanitize_title=lambda title: title.strip())
+    )
+    monkeypatch.setitem(sys.modules, "hermes_state", sessions)
+    a = make_adapter(calls={"enabled": True})
+    host = a._build_calls(MagicMock()) and a._calls_host
+
+    def free(title, db=None, store=None):
+        a.gateway_runner = types.SimpleNamespace(_session_db=db, async_session_store=store)
+        return asyncio.run(host._free_title(object(), title))
+
+    assert free("Calls with sam") == "Calls with sam"  # no session database: sent as it is
+    assert free(" Calls with sam ", Db({}), Store()) == "Calls with sam"
+    assert free("Calls with sam", Db({"s-old": "Calls with sam"}), Store()) == "Calls with sam #2"
+    assert free("Calls with sam", Db({"s-1": "Calls with sam", "s-2": "Calls with sam #2"}), Store()) == "Calls with sam #3"
+    assert free("Calls with sam", Db({"s-now": "Calls with sam"}), Store()) is None  # keep its title
+    long = "x" * 100  # Hermes allows 100 characters: " #2" must not push it over
+    numbered = free(long, Db({"s-old": long}), Store())
+    assert len(numbered) <= 100 and numbered != long
+
+    class Broken(Db):
+        async def get_session_title(self, session_id):
+            raise RuntimeError("database is locked")
+
+    assert free("Calls with sam", Broken({}), Store()) == "Calls with sam"  # never blocks the call
 
 
 def test_steer_sends_a_steer_command_for_the_pending_turn(monkeypatch):

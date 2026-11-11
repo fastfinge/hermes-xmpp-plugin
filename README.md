@@ -463,8 +463,11 @@ and `silence_ms` must be positive; `filler_after` cannot be negative. Times are 
 |---|---|---|
 | `enabled` (`XMPP_CALLS_ENABLED`) | bool, `false` | Master switch. The env var is used only when the YAML key is absent. Accepts `1/true/yes/on`. |
 | `allowed_users` | list or comma string, empty | Who may call, and be called by, the agent. Empty: every `xmpp.allowed_users` JID except `plaintext_peers` and `agent_peers`. Set: exactly these (they must also pass the normal chat authorization; a listed partner agent would be callable, so do not list one). With `allow_all_users: true` and this empty, nobody can call. Several people are fine; with more than one the `xmpp_call` tool needs `to`. Compared lowercase against the caller's bare JID. |
-| `max_seconds` | int or `false`, `600` | Hang up after this long, whoever is talking. `false` lifts the limit (a silent call still ends after `idle_timeout`; set that to `0` too and a call lasts until someone hangs up). |
+| `max_seconds` | int or `false`, `600` | Hang up after this long, whoever is talking. Thirty seconds before the end the call says once "This call will end in thirty seconds." (no notice for a very short limit; nothing extends the limit, so set a larger value and restart for longer calls). `false` lifts the limit (a silent call still ends after `idle_timeout`; set that to `0` too and a call lasts until someone hangs up). |
 | `greeting` | string or list, `Hi, I'm here. What can I do for you?` | Spoken when someone calls the bot (incoming calls only; outgoing calls speak the `opening`). Give a list and one is picked at random each call, never the same twice in a row. `""`, `[]` or `false` for silence. The whole phrase is synthesized once and kept (see [Phrase audio cache](#phrase-audio-cache)). Example: `["Hi, I'm here. What can I do for you?", "Hello! What's up?", "Yes? I'm listening.", "Hey there, go ahead.", "Hi! How can I help?", "I'm all ears. What do you need?"]`. |
+| `session` | `per_call` \| `per_peer`, `per_call` | Which Hermes session a call runs in. `per_call`: a new session for every call (a DM thread `call-<id>`), listed with its own history; suits a dedicated call-center profile. `per_peer`: one persistent session per person (thread `calls`) shared by all their calls, so the agent remembers earlier calls; it keeps growing until `/new` or a reset policy, and compression applies as in any chat. Anything else logs a warning and means `per_call`. See [Sessions](#sessions). |
+| `session_title` | string, `""` | Title of the call session. `""` is `Call {direction} {name} {time} {topic}` for `per_call` and `Calls with {name}` for `per_peer`. Fields: `{direction}` (`from` or `to`), `{name}` (the JID before the @), `{jid}`, `{time}` (`2026-11-11 09:00`), `{date}`, `{topic}` (what the agent gave `xmpp_call`, else empty). Extra spaces are dropped; at most 100 characters; a template with another field or a stray brace logs a warning and the default is used. A session is titled once (when it has no title yet), so a `per_peer` session keeps its first title. Hermes keeps titles unique: a title another session already has gets Hermes' own numbering (`Calls with sam #2`), so a template without `{time}` still names every call. |
+| `session_rotate` | `never` \| `daily` \| `weekly` \| `monthly`, `never` | Only with `session: per_peer`: start a new session for each period, so the session cannot grow forever. The period goes into the thread name (`calls-2026-11-12`, `calls-2026-W46`, `calls-2026-11`, local time); a new period is a new Hermes session, and because its title is taken Hermes numbers it (`Calls with sam #2`), so the break is visible in the session list. A call that runs past the end of a period stays in the session it started in. With `never` the session lasts until you reset it. Anything else logs a warning and means `never`. |
 | `silence_ms` | int ms, `800` | Pause that ends your turn. Raise (1000-1500) if you get cut off while thinking; lower for snappier answers. |
 | `vad_level` | int 0-3, `2` | Noise rejection (WebRTC VAD). Higher ignores more background noise but may miss soft speech. Out-of-range values are clamped. Steady hum, fans and hiss are ignored at every level. |
 | `ack_tone` | bool or file, `true` | The short beep when your turn is captured. `false` or `""` turns it off. A path plays that sound instead (see [Custom sounds](#custom-sounds)). |
@@ -507,7 +510,9 @@ Jingle initiation without a preceding proposal is supported (Dino uses this path
 | "One moment." (spoken) | The agent is still working after `filler_after` seconds. |
 
 Short transcripts that are only a stock phrase such as "Thank you." or "Thanks for watching" are treated
-as noise and dropped, because speech-to-text models often invent them from room sound.
+as noise and dropped, because speech-to-text models often invent them from room sound. A lone "Bye"
+(or "By", which it sounds like) is always dropped, however long it took: it is too easily
+misheard to hang up on. "Bye bye" and "goodbye" are not dropped.
 
 **How it knows you finished.** Speech is told from noise by the WebRTC voice detector. After
 `silence_ms` without speech the turn is cut, the beep confirms it, and the agent answers. If you
@@ -520,7 +525,7 @@ agent finishes its sentence, then answers everything you said as one message. If
 still working (a tool call, a search) when you speak, your words are sent to it as `/steer`, so
 it takes them in after its next tool call without restarting; if that is not possible they are
 queued (the `/steer` path has not been verified against a live gateway). With `barge_in: stop`
-your voice cuts the agent off and its next turn is told how much you heard. Say goodbye and the
+your voice cuts the agent off and its next turn is told how much you heard. Say goodbye (or "bye bye") and the
 agent ends the call. A reply that cannot be spoken (TTS down or busy, after retries) is posted
 to the chat as text instead.
 
@@ -563,19 +568,39 @@ time limit ends the call, the plugin still transcribes what you were saying, let
 too, including when a previous reply said goodbye or failed. This finishing work has a 180-second
 budget; remaining local tasks are cancelled afterward. Cancelling a task cannot undo completed
 tool actions or forcibly stop a provider thread. Late synthesis never adds audio to a closed call.
-You can call back later and follow up; each call has a separate session, with missed-call context
-only as described below. After a call with answered turns, the recap text tells you what the
+You can call back later and follow up; with the default `session: per_call` each call has a separate
+session, with missed-call context only as described below (`per_peer` keeps one session for all of
+a person's calls). After a call with answered turns, the recap text tells you what the
 agent understood and did (unless `recap` is off or it returns `NONE`).
 
 **Missed calls.** If you do not answer or you decline an agent's call (after `ring_attempts` rings), the opening is
 sent to your chat as text and remembered: when you call back, the agent knows what it wanted to
 tell you. The memory is in the gateway process only; a restart forgets it.
 
-**Sessions.** Every call is its own Hermes session (a DM thread `call-<id>`, titled "Call from|to
-<person> <date time>", plus the `topic` the agent gave to `xmpp_call`, such as a cron job name),
-with the full history in your sessions list. The agent has all the tools of its profile in a
-call, including delegation and messaging; it is only asked to keep spoken replies short (one to
-three plain sentences). A spoken turn waits at most 180 s for the agent.
+**Time limit.** `max_seconds` ends the call exactly then. Thirty seconds before, the call says once
+"This call will end in thirty seconds." (after the sentence being spoken, never after a hang-up;
+not at all for a very short limit). Nothing the caller or the agent says extends it.
+
+#### Sessions
+
+Calls never run in your normal text chat session. `session` picks how they are grouped:
+
+| | `per_call` (default) | `per_peer` |
+|---|---|---|
+| Hermes session | a new one for every call (DM thread `call-<id>`) | one per person (DM thread `calls`), kept across calls and restarts |
+| Default title | `Call from\|to <person> <date time> <topic>` | `Calls with <person>` |
+| The agent remembers | only this call (plus its normal memory) | all earlier calls with that person |
+| History in the sessions list | one entry per call, with the `topic` the agent gave `xmpp_call` (a cron job name) | one long entry that grows |
+| Good for | a call-center profile where calls are unrelated; one entry per call is easy to find and delete | a personal assistant you phone repeatedly; a recurring cron call that should know what it said yesterday |
+
+Both give the agent all the tools of its profile in a call, including delegation and messaging; it
+is only asked to keep spoken replies short (one to three plain sentences). A spoken turn waits at
+most 180 s for the agent. Hermes gateway sessions are not reset by inactivity, so a `per_peer`
+session keeps growing; compression keeps it within the context window. Set `session_rotate` to
+`daily`, `weekly` or `monthly` to start a new session per period. A `/new` sent in the XMPP chat
+starts over only the normal chat session, not the calls session: to start the calls session over
+at any other time, reset or delete it from Hermes Desktop or the CLI (`hermes sessions`). The call recap is asked inside the call's own session in both modes. Change
+`session_title` to taste, for example `{topic} {date}` for a cron-oriented profile.
 
 #### The agent can call you
 
@@ -719,8 +744,11 @@ phone and from the bot's host; on a Tailscale network that is an ACL matter (see
   `log_transcripts: true` puts both sides' full text in the log at INFO level. Exception: when
   a clip yields no words, the log line `heard no words ...` shows the (empty or stock-phrase)
   transcript.
-- **Sessions**: every call is a Hermes session with its full text history, regardless of
-  `log_transcripts`. Delete it from your sessions list if you do not want it kept.
+- **Sessions**: every call is part of a Hermes session with its full text history, regardless of
+  `log_transcripts` (one session per call, or one per person with `session: per_peer`). Delete the
+  session from your sessions list if you do not want it kept. What was said on a call never reaches
+  your XMPP client as chat history; only texts the plugin sends (recap, missed-call text, replies that
+  could not be spoken) do.
 - **Chat**: the recap, a missed call's full `opening` (which can be a whole briefing), and a reply
   that could not be spoken are sent to your chat as text. They are OMEMO-encrypted unless OMEMO is
   off or the recipient is a `plaintext_peers` entry. Set `recap: false` to skip recaps.

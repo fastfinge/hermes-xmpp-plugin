@@ -1,7 +1,7 @@
 name: hermes-xmpp-plugin
 label: XMPP/Jabber
 kind: platform
-version: 0.5.0
+version: 0.6.0
 description: >
   Third-party XMPP/Jabber gateway platform plugin for Hermes Agent. Supports
   1:1 chat, MUC rooms, typing indicators, message reactions, threaded replies,

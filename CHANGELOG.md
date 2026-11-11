@@ -2,10 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.0] — Call sessions and a time-limit notice
 
 ### Added
 
+- `xmpp.calls.session` (`per_call` default, or `per_peer`: one persistent Hermes session per person
+  for all their calls) and `xmpp.calls.session_title` (a template with `{direction} {name} {jid}
+  {time} {date} {topic}`). `xmpp.calls.session_rotate` (`never` default, `daily`, `weekly`,
+  `monthly`) starts a new `per_peer` session for each period. Call sessions get unique titles: a taken title gets Hermes' own
+  numbering (`Calls with sam #2`), and a session that already has a title keeps it.
+- A lone "bye" (or "by") spoken on a call is never taken as a goodbye; "bye bye" and "goodbye" are.
+- A call now says once, thirty seconds before `max_seconds`, that it will end (no notice for a very
+  short limit; nothing extends the limit).
 - `xmpp.plaintext_peers`: bare JIDs that never get OMEMO-encrypted messages.
 - OMEMO: a contact's device list is downloaded before encrypting to them (slixmpp-omemo skips it
   under mutual presence, so a fresh store failed with `NoEligibleDevices`).
@@ -19,6 +27,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Voice messages are uploaded with their audio content type on hosts that have no system MIME
+  table (#17).
 - OMEMO key file safety: one process per file (lock), atomic owner-only writes that also sync the
   directory, symlinked paths resolved before writing, and a file that is unreadable or empty is
   never replaced by a new identity (OMEMO stays off and the log says why). The lock survives module
