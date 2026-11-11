@@ -1,3 +1,5 @@
+> **Superseded.** This is the original feasibility note (2025). Audio calls are now implemented in `calls/`; see the README, section "Audio calls".
+
 # Jingle Voice Calls — Feasibility Investigation
 
 **Date:** 2025-05-31
@@ -63,7 +65,8 @@ The code works by parsing SDP strings with regex and converting them to Jingle X
 
 ```python
 def make_description(self, sdp, media):
-    m = re.search(r'^m='+media+' +(\d+) +([\w/]+)([ \d]*)$', sdp, re.M)
+    m = re.search(r'^m='+media+' +(\d+) +([\w/]+)([ \d]*)
+$', sdp, re.M)
     # ... parses SDP lines into Jingle Description stanzas
 ```
 

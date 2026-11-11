@@ -34,10 +34,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -r requirements.txt -r requirements-dev.txt -r requirements-calls.txt
 
       - name: Run test suite
         env:
+          # makes tests/calls_engine fail instead of silently not being collected
+          XMPP_REQUIRE_CALL_DEPS: "1"
           HERMES_SOURCE: ${{ matrix.hermes == 'pinned' && format('{0}/hermes-core', github.workspace) || '' }}
         # Deliberately no PYTHONPATH: the suite must pass in a standalone
         # plugin checkout (fake gateway/tools bootstrap in each test file).

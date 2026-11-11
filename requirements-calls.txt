@@ -1,0 +1,7 @@
+# Audio calls (xmpp.calls.enabled). With calls on, the plugin builds an isolated Hermes environment
+# from these lines (call_packages.py), or reads a vendor/ folder made from them by hand.
+# av is left to aiortc's own range (14 up to 19): macOS on Apple Silicon only has wheels up to 15.
+aiortc>=1.16,<2
+av>=14
+numpy>=2
+webrtcvad-wheels>=2.0.14
