@@ -321,6 +321,31 @@ async def test_readiness_does_not_depend_on_session_start_ever_firing(monkeypatc
     await a.disconnect()
 
 
+@pytest.mark.skipif(not adapter.SLIXMPP_OMEMO_AVAILABLE, reason="slixmpp-omemo not installed")
+@pytest.mark.asyncio
+async def test_unusable_omemo_store_leaves_chat_up_with_omemo_off(monkeypatch, tmp_path):
+    """The store refuses a damaged file while slixmpp initialises the plugin; connect() must
+    still complete, OMEMO must stay unregistered (so sends are plaintext, never half-encrypted)
+    and the file must stay as it was."""
+    store = tmp_path / "omemo.json"
+    store.write_text('{"/ikp/key": "secret"')  # cut off mid-write
+
+    class _Client(_FakeSlixmppClient):
+        def register_plugin(self, name, config=None, *a, **k):
+            if name == "xep_0384" and config:  # slixmpp's plugin_init opens the configured store
+                adapter._StorageImpl(Path(config["json_file_path"]))
+            super().register_plugin(name)
+
+    a = adapter.XmppAdapter(_make_cfg(omemo_enabled="true", omemo_storage_path=str(store)))
+    monkeypatch.setattr(adapter, "ClientXMPP", _Client)
+
+    assert await a.connect() is True
+    assert "xep_0384" not in a._registered_plugins
+    assert a._use_omemo("user@example.org", "chat") is False
+    assert store.read_text() == '{"/ikp/key": "secret"'
+    await a.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_omemo_initialized_is_a_redundant_readiness_trigger(monkeypatch):
     """Regression: a production connection never reached readiness via

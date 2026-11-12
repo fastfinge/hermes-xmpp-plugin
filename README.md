@@ -145,6 +145,7 @@ multiplexed gateway read [Multiple Hermes profiles](#multiple-hermes-profiles).
 | `home_channel` | `XMPP_HOME_CHANNEL` | none | Default JID or room for cron and `send_message` delivery. YAML may be a string or `{chat_id: ...}`. |
 | `omemo_enabled` / `omemo.enabled` | `XMPP_OMEMO_ENABLED` | `true` | OMEMO is used only when `slixmpp-omemo` and `omemo` are installed; if enabled but missing, a warning is logged and chat is plaintext over TLS. |
 | `omemo_storage_path` / `omemo.storage_path` | `XMPP_OMEMO_STORAGE_PATH` | `<profile home>/xmpp_omemo.json` | OMEMO key file. One file per profile. |
+| `plaintext_peers` | `XMPP_PLAINTEXT_PEERS` | none | Peers that get unencrypted messages (see OMEMO). |
 | `agent_peers` | `XMPP_AGENT_PEERS` | none | Partner agents (see Several agents). |
 | `agent_peer_limit` | none | `4` | Messages accepted from one partner agent per 10 minutes; the rest are dropped with a log warning. Whole number 1-1000, anything else uses the default. |
 | `message_tool_limit` | none | `10` | `xmpp_message` sends per recipient per 10 minutes. Whole number 1-1000, anything else uses the default. |
@@ -189,6 +190,37 @@ before sending encrypted messages. If the recipient hasn't published device keys
 yet, or encryption fails for any other reason, the message is sent **unencrypted** (with a log
 warning `OMEMO: encryption failed for ..., sending plaintext`). Inbound OMEMO messages that cannot
 be decrypted are dropped with a log warning.
+
+Before encrypting to a contact the adapter downloads their OMEMO device list (at most
+once per 10 minutes). Without this, a fresh account that has not yet heard from the contact
+fails with "NoEligibleDevices" even when presence is mutual.
+
+To skip OMEMO for specific peers, such as another agent on your own trusted server, set
+`xmpp.plaintext_peers` (or `XMPP_PLAINTEXT_PEERS`) to a list of bare JIDs. Trade-off: everything
+sent *to* those peers (including call hand-offs, recaps and missed-call texts addressed to them)
+is readable by your server operator; what they send you is unaffected. No OMEMO sessions are
+created for them, which avoids stale-session breakage between two agents. Empty by default.
+Peers listed here are also never callable.
+
+**Keeping the keys safe.** The key file holds your private OMEMO identity and every session. The
+adapter protects it:
+
+- one process per key file: the file is locked while the gateway runs, and a second process that
+  opens the same file (a second gateway on the same home, a script) gets OMEMO switched off with a
+  log line instead of overwriting the sessions; the one-shot sender (`send_xmpp_message`, used by
+  `hermes send` and cron delivery from the CLI) never uses OMEMO for the same reason, so what it
+  sends is protected by TLS only (readable by your server operator), where it used to be
+  OMEMO-encrypted. Messages the running gateway sends are unaffected;
+- writes are atomic (temp file, fsync, rename) and the file is owner-only (`0600`);
+- a key file that cannot be read, or is empty (what an interrupted write leaves), is never
+  replaced by a new one: OMEMO stays off and the log says why. Restore a backup, or move the file away to start with a new identity.
+
+Give each Hermes profile its own file (the default is `<profile home>/xmpp_omemo.json`).
+The lock survives in-process plugin reloads and remains held until process exit. Symlinked store
+paths update their resolved target without replacing the symlink. POSIX uses `flock`; Windows
+uses a nonblocking byte-range lock (covered by simulated tests, not native Windows acceptance).
+Do not configure independent adapters to share a store, even inside one process: they hold
+separate in-memory session snapshots.
 
 Only 1:1 (`chat`) messages are sent through OMEMO by the send path; treat rooms as visible to the
 server. 1:1 encryption is the primary use case.
@@ -265,7 +297,7 @@ supporting XEP-0444, XEP-0461, and XEP-0394.
   `muc_allowed_users` (or `allowed_users`).
 - Replies arrive unencrypted although OMEMO is on: look for the `OMEMO: encryption failed ...
   sending plaintext` warning; usually `NoEligibleDevices` (the contact has no published OMEMO
-  devices yet).
+  devices yet). Device lists are re-downloaded at most every 10 minutes.
 - Audio calls: see [Troubleshooting calls](#troubleshooting-calls).
 
 ## Features in depth
@@ -430,7 +462,7 @@ and `silence_ms` must be positive; `filler_after` cannot be negative. Times are 
 | Option | Type, default | What it does |
 |---|---|---|
 | `enabled` (`XMPP_CALLS_ENABLED`) | bool, `false` | Master switch. The env var is used only when the YAML key is absent. Accepts `1/true/yes/on`. |
-| `allowed_users` | list or comma string, empty | Who may call, and be called by, the agent. Empty: every `xmpp.allowed_users` JID except `agent_peers`. Set: exactly these (they must also pass the normal chat authorization; a listed partner agent would be callable, so do not list one). With `allow_all_users: true` and this empty, nobody can call. Several people are fine; with more than one the `xmpp_call` tool needs `to`. Compared lowercase against the caller's bare JID. |
+| `allowed_users` | list or comma string, empty | Who may call, and be called by, the agent. Empty: every `xmpp.allowed_users` JID except `plaintext_peers` and `agent_peers`. Set: exactly these (they must also pass the normal chat authorization; a listed partner agent would be callable, so do not list one). With `allow_all_users: true` and this empty, nobody can call. Several people are fine; with more than one the `xmpp_call` tool needs `to`. Compared lowercase against the caller's bare JID. |
 | `max_seconds` | int or `false`, `600` | Hang up after this long, whoever is talking. `false` lifts the limit (a silent call still ends after `idle_timeout`; set that to `0` too and a call lasts until someone hangs up). |
 | `greeting` | string or list, `Hi, I'm here. What can I do for you?` | Spoken when someone calls the bot (incoming calls only; outgoing calls speak the `opening`). Give a list and one is picked at random each call, never the same twice in a row. `""`, `[]` or `false` for silence. The whole phrase is synthesized once and kept (see [Phrase audio cache](#phrase-audio-cache)). Example: `["Hi, I'm here. What can I do for you?", "Hello! What's up?", "Yes? I'm listening.", "Hey there, go ahead.", "Hi! How can I help?", "I'm all ears. What do you need?"]`. |
 | `silence_ms` | int ms, `800` | Pause that ends your turn. Raise (1000-1500) if you get cut off while thinking; lower for snappier answers. |
@@ -632,6 +664,8 @@ xmpp:
 Which side may call: only a profile with `calls.enabled` can place calls, and only to a
 callable JID (people, not partners). The worker only sends text with `xmpp_message`, which works
 with calls off; nobody has to call the worker.
+Add `plaintext_peers` for the partner only if OMEMO between the agents gets in the way (see
+[OMEMO](#omemo-end-to-end-encryption-optional)).
 
 **Hand-off pattern (cron job → phone agent → you).** A convention between two prompts; the
 plugin enforces only the steps marked *(Plugin)*.
@@ -689,7 +723,7 @@ phone and from the bot's host; on a Tailscale network that is an ACL matter (see
   `log_transcripts`. Delete it from your sessions list if you do not want it kept.
 - **Chat**: the recap, a missed call's full `opening` (which can be a whole briefing), and a reply
   that could not be spoken are sent to your chat as text. They are OMEMO-encrypted unless OMEMO is
-  off. Set `recap: false` to skip recaps.
+  off or the recipient is a `plaintext_peers` entry. Set `recap: false` to skip recaps.
 - **Signalling** (who calls whom, when) is ordinary XMPP, not OMEMO. Media is DTLS-SRTP (an offer
   without a DTLS fingerprint is refused), so a TURN relay sees only encrypted packets.
 - The `xmpp_call` / `xmpp_message` tools can reach only `allowed_users` (and, for messages, `agent_peers`).
@@ -716,7 +750,7 @@ First look in the gateway log. Lines to know: `xmpp: audio calls enabled`, `call
 | Symptom | Likely cause and fix |
 |---|---|
 | **No call button / no ring on the person's phone (agent calls out)** | Tool says `calls are not enabled or XMPP is not connected`: calls off, dependencies missing (see the `unavailable` log line) or gateway not connected. `cannot call X; callable people: ...`: X not callable (not in `allowed_users`, is a partner agent, or not in `calls.allowed_users`). `no answer: nobody picked up in time`: no device answered the proposal within `ring_timeout` (client offline, bot not a mutual contact, or a client without call support; Dino skips resources that do not advertise Jingle RTP). |
-| **Bot ignores an incoming call** (rings out, no reply) | Caller is not callable. Unauthorized calls get no answer at all. Check `allowed_users`, `calls.allowed_users`, that the caller is not in `agent_peers`, and that `allow_all_users` is not your only list (it does not make anyone callable). |
+| **Bot ignores an incoming call** (rings out, no reply) | Caller is not callable. Unauthorized calls get no answer at all. Check `allowed_users`, `calls.allowed_users`, that the caller is not in `agent_peers` or `plaintext_peers`, and that `allow_all_users` is not your only list (it does not make anyone callable). |
 | **"Busy"** | One call at a time. A second incoming call is rejected/terminated with `busy`; an outgoing call waits `busy_wait` s, then returns `busy: another call is in progress`. A stuck call ends at `idle_timeout` or `max_seconds`. |
 | **Call rings on the phone but is rejected / drops at once** | Log says `calls: refusing call ...`: the offer had no DTLS fingerprint (`security-error`), no Opus or no audio (`unsupported-applications`), or the offer was malformed (`general-error`). Use a client with DTLS-SRTP and Opus. On outgoing calls, `declined: the person rejected the call` means the person (or a quick phone timeout, under 25 s) rejected it. |
 | **Connects but one-way audio or silence** | Read the `rtp received/sent` log lines. `received` 0: the person's audio does not reach the bot; `sent` growing but the person hears nothing: their path from the bot is blocked. Almost always ICE/TURN reachability: see the next row. If both counters grow and you hear nothing, it is a TTS/playback issue (below). |
@@ -726,7 +760,7 @@ First look in the gateway log. Lines to know: `xmpp: audio calls enabled`, `call
 | **Cut off mid-sentence / hears background noise** | Raise `silence_ms` (1000-1500) / raise `vad_level`. |
 | **Hangs up by itself** | `idle_timeout` (60 s of quiet), `max_seconds` (600, unless `false`), or the agent said goodbye (two falling beeps, then `hangup_grace`). |
 | **Agent has no `xmpp_call` tool** | Enable toolset `xmpp_calls` for the gateway/cron job; the tools appear only while the adapter is connected with calls enabled. |
-| **OMEMO `NoEligibleDevices` on recap / missed-call text** | The bot has no device list for the person. Open the person's OMEMO-capable client once and have them send a message. Note the fallback: after an encryption failure the bot sends that text **unencrypted** and logs `OMEMO: encryption failed for ..., sending plaintext`. |
+| **OMEMO `NoEligibleDevices` on recap / missed-call text** | The bot has no device list for the person. Open the person's OMEMO-capable client once and have them send a message; the bot re-downloads device lists at most every 10 minutes. Note the fallback: after an encryption failure the bot sends that text **unencrypted** and logs `OMEMO: encryption failed for ..., sending plaintext`. |
 
 ### Ad-hoc commands (XEP-0050)
 

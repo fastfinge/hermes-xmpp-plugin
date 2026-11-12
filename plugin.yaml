@@ -82,6 +82,10 @@ optional_env:
     description: Enable audio calls (Jingle RTP). Off by default; the first start with calls on installs the call packages (about 230 MB) into their own Hermes environment. The xmpp.calls.* config keys override it.
     prompt: Enable audio calls? true/false
     password: false
+  - name: XMPP_PLAINTEXT_PEERS
+    description: Comma-separated bare JIDs that never receive OMEMO-encrypted messages (opt-in; for trusted partner agents). Empty by default.
+    prompt: Plaintext peer JIDs
+    password: false
   - name: XMPP_AGENT_PEERS
     description: Comma-separated bare JIDs of partner agents. They may message the agent (rate limited) but can never call or be called.
     prompt: Partner agent JIDs

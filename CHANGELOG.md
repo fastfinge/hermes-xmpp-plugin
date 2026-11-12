@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `xmpp.plaintext_peers`: bare JIDs that never get OMEMO-encrypted messages.
+- OMEMO: a contact's device list is downloaded before encrypting to them (slixmpp-omemo skips it
+  under mutual presence, so a fresh store failed with `NoEligibleDevices`).
+
+### Changed
+
+- **The one-shot sender (`send_xmpp_message`, behind `hermes send` and CLI cron delivery) no longer
+  uses OMEMO.** Those messages are protected by TLS only, where they used to be OMEMO-encrypted:
+  a second process advancing the double ratchets would break the running gateway's sessions.
+  Messages sent by the running gateway are not affected.
+
+### Fixed
+
+- OMEMO key file safety: one process per file (lock), atomic owner-only writes that also sync the
+  directory, symlinked paths resolved before writing, and a file that is unreadable or empty is
+  never replaced by a new identity (OMEMO stays off and the log says why). The lock survives module
+  reloads. Windows locking is simulation-tested only.
+
 ## [0.5.0] — Audio calls and agent hand-off
 
 ### Added
