@@ -5,6 +5,7 @@ one `Conversation` per call. Host-agnostic: the Hermes plugin and the dev bots b
 import asyncio
 import logging
 import re
+import string
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -41,11 +42,19 @@ CALL_FEATURES = (
 
 RECAP_PROMPT = (
     "[The call has ended. In one or two plain sentences for a chat message, say what the person "
-    "asked for or wanted changed during the call and what you did about it. If they asked for "
-    "nothing, reply exactly NONE.]"
+    "asked for or wanted changed during the call that just ended and what you did about it. "
+    "If they asked for nothing, reply exactly NONE.]"
 )
 TICK_S = 10.0  # how often a running call checks its limits (tests shorten it)
 CONNECT_LIMIT = 40.0  # a call whose media is not up after this long is dead
+TITLE_FIELDS = ("direction", "name", "jid", "time", "date", "topic")
+TITLE_DEFAULTS = {
+    "per_call": "Call {direction} {name} {time} {topic}",
+    "per_peer": "Calls with {name}",
+}
+HEADS_UP_S = 30.0  # the call says once that it ends this long before max_seconds
+HEADS_UP = "This call will end in thirty seconds."
+HEADS_UP_LEAD_S = 3.0  # speaking it takes a while; start early so "thirty" is true when it is said
 IDLE_GOODBYE = "I do not hear anyone, so I am hanging up. Call me back any time."
 CLIENT_RING_LIMIT = 25.0  # a "reject" after ringing this long is the phone timing out
 MIN_RERING = 5.0  # do not ring again with less than this left of the ring time
@@ -99,9 +108,25 @@ class CallConfig:
     idle_timeout: float = 60.0  # nobody has spoken for this long: say goodbye and hang up (0: off)
     log_transcripts: bool = False  # log what was said (default: only how many words)
     recap: bool = True  # after a call with talk in it, text the person what was asked and done
+    session: str = "per_call"  # "per_call": a Hermes session per call; "per_peer": one per person
+    session_title: str = ""  # title template (see TITLE_FIELDS); "" is the mode's default
     barge_in: str = (
         "queue"  # "queue": talk any time, it becomes the next turn; "stop": cut the agent off
     )
+
+
+def render_title(template: str, **values: str) -> str | None:
+    """Fill `{direction} {name} {jid} {time} {date} {topic}` into `template`. One plain line of at
+    most 100 characters (the title travels inside a /title command). None when the template names
+    another field or has a stray brace, so the caller can fall back to the default."""
+    try:
+        parts = list(string.Formatter().parse(template))
+    except ValueError:
+        return None
+    if any(f is not None and (f not in TITLE_FIELDS or spec or conv) for _, f, spec, conv in parts):
+        return None
+    title = " ".join(template.format(**values).split()).lstrip("/")[:100]
+    return title or None
 
 
 class Call:
@@ -493,11 +518,26 @@ class CallController:
         )
 
     def _name(self, sid: str, bare: str, direction: str, topic: str = "") -> None:
-        """Title the call's session: "Call from|to <person> <YYYY-MM-DD HH:MM> [<topic>]"."""
-        when = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # One plain line: the title travels inside a /title command.
-        topic = " ".join(re.sub(r"[^\w .:@-]", " ", topic).split())[:60]
-        title = f"Call {direction} {bare.split('@', 1)[0]} {when}" + (f" {topic}" if topic else "")
+        """Title the call's session from `config.session_title` (default: "Call from|to <person>
+        <YYYY-MM-DD HH:MM> [<topic>]", or "Calls with <person>" for one session per person). The
+        host titles a session once and makes the title unique, so this runs for every call."""
+        now = datetime.now()
+        values = {
+            "direction": direction,
+            "name": bare.split("@", 1)[0],
+            "jid": bare,
+            "time": now.strftime("%Y-%m-%d %H:%M"),
+            "date": now.strftime("%Y-%m-%d"),
+            "topic": " ".join(re.sub(r"[^\w .:@-]", " ", topic).split())[:60],
+        }
+        default = TITLE_DEFAULTS.get(self.config.session, TITLE_DEFAULTS["per_call"])
+        title = render_title(self.config.session_title or default, **values)
+        if title is None:
+            logging.warning(
+                "calls: session_title %r is not usable; using the default",
+                self.config.session_title,
+            )
+            title = render_title(default, **values) or "Call"
         task = asyncio.create_task(self.host.name_call(bare, sid, title))
         self._background.add(task)
         task.add_done_callback(self._background.discard)
@@ -731,12 +771,20 @@ class CallController:
             await call.convo.say(self._last_greeting, cached=True)
 
     async def _limit(self, sid: str) -> None:
-        """Enforce the call time limit; meanwhile log RTP counts every 10 s (is audio flowing?)."""
+        """Enforce the call time limit; meanwhile log RTP counts every 10 s (is audio flowing?).
+        `HEADS_UP_S` (plus the lead) before the limit the call says so once. Nothing extends the
+        limit."""
         loop = asyncio.get_running_loop()
         started = loop.time()
-        deadline = started + self.config.max_seconds if self.config.max_seconds else None
+        limit = self.config.max_seconds
+        deadline = started + limit if limit else None
+        notice_at = HEADS_UP_S + HEADS_UP_LEAD_S  # seconds left when the notice is queued
+        warned = not limit or limit <= notice_at  # a very short limit gets no notice
         while deadline is None or (left := deadline - loop.time()) > 0:
-            await asyncio.sleep(TICK_S if deadline is None else min(TICK_S, left))
+            step = TICK_S if deadline is None else min(TICK_S, left)
+            if not warned and deadline is not None and left > notice_at:
+                step = min(step, left - notice_at)  # wake up when the notice is due
+            await asyncio.sleep(step)
             call = self.calls.get(sid)
             if call is not None:
                 logging.info("calls: %s rtp received/sent %s", sid[:8], await call.media.packets())
@@ -748,7 +796,19 @@ class CallController:
                     await call.convo.say(IDLE_GOODBYE)
                     await call.convo.playback.wait_idle()
                     break
+                if not warned and deadline is not None and deadline - loop.time() <= notice_at:
+                    warned = True
+                    logging.info("calls: %s ends in %d s, saying so", sid[:8], HEADS_UP_S)
+                    # its own task: queued behind the sentence being spoken, never waited for here
+                    task = asyncio.create_task(self._heads_up(call.convo))
+                    self._background.add(task)
+                    task.add_done_callback(self._background.discard)
         await self.end(sid, "success", notify=True)
+
+    @staticmethod
+    async def _heads_up(convo: Conversation) -> None:
+        if not convo.closed:  # after hang-up `say` would send the notice as a chat text
+            await convo.say(HEADS_UP, cached=True)
 
     async def end(self, sid: str, reason: str | None, notify: str | bool = False) -> None:
         """Close one call; with `reason`, tell the peer (`notify`: its JID, or True)."""

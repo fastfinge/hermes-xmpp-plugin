@@ -14,7 +14,10 @@ MIN_SENTENCE = 25  # shorter pieces are merged forward: each TTS call costs ~1 s
 
 
 # What Whisper-style models "hear" in room noise or silence.
-_PHANTOMS = {"thank you", "thanks", "thank you for watching", "thanks for watching", "you", "bye"}
+_PHANTOMS = {"thank you", "thanks", "thank you for watching", "thanks for watching", "you"}
+# A lone "bye" (or "by", which is what it sounds like) is never a goodbye, however long it took to
+# say. "Bye bye", "Bye. Bye." and "goodbye" are not in this set and reach the agent.
+_NEVER_A_GOODBYE = {"bye", "by"}
 PHANTOM_MAX_S = 3.0
 
 
@@ -23,12 +26,19 @@ def is_phantom(text: str, seconds: float) -> bool:
     letters = re.sub(r"[^a-z ]", "", text.lower()).strip()
     if not any(c.isalnum() for c in text) or re.fullmatch(r"[\[(].*[\])]", text.strip()):
         return True  # "♪♪♪", "[music]", "(silence)": sound effects, not words
+    if letters in _NEVER_A_GOODBYE:
+        return True
     if letters in _PHANTOMS:
         return seconds < PHANTOM_MAX_S
     # "Thank you. Thank you. Thank you.": the same stock phrase over and over, at any length
     parts = [re.sub(r"[^a-z ]", "", p).strip() for p in re.split(r"[.!?]+", text.lower())]
     parts = [p for p in parts if p]
-    return len(parts) >= 2 and all(p in _PHANTOMS for p in parts)
+    # A mix such as "Thank you. Bye." stays noise (it was before); only "Bye. Bye." is speech.
+    return (
+        len(parts) >= 2
+        and all(p in _PHANTOMS | _NEVER_A_GOODBYE for p in parts)
+        and any(p in _PHANTOMS for p in parts)
+    )
 
 
 def clean(text: str) -> str:

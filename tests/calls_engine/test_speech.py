@@ -54,3 +54,15 @@ def test_stock_phrases_from_noise_are_phantoms_only_when_short() -> None:
     assert is_phantom("♪♪♪♪", 2.8)
     assert is_phantom("[Music]", 9.0)
     assert not is_phantom("Okay.", 1.0)
+    # a lone "bye" (or the "by" it sounds like) never says goodbye, however slowly
+    assert is_phantom("Bye.", 1.0)
+    assert is_phantom("Bye", 6.0)
+    assert is_phantom("By.", 4.0)
+    assert not is_phantom("Bye bye.", 1.5)
+    assert not is_phantom("Bye. Bye.", 1.5)  # speech-to-text punctuates a double bye like this
+    assert not is_phantom("Bye. Bye. Bye.", 4.0)
+    assert not is_phantom("bye, bye", 1.5)
+    assert is_phantom("Thank you. Bye.", 3.5)  # a mix of stock phrases is still noise
+    assert is_phantom("Bye. Thank you. Thank you.", 5.0)
+    assert not is_phantom("Goodbye.", 1.0)
+    assert not is_phantom("Okay, thanks, bye.", 2.0)

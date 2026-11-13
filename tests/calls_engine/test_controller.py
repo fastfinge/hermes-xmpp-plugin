@@ -326,6 +326,7 @@ async def test_the_call_ends_at_max_seconds_and_no_limit_means_no_end(monkeypatc
     await asyncio.wait_for(ctl._limit(sid), 5)  # returns once the limit ended the call
     assert sid not in ctl.calls
     assert not any("hanging up" in s for s in spoken)  # cut at the limit, not idle
+    assert controller.HEADS_UP not in spoken  # a limit shorter than the heads-up gets none
     await phone.close()
 
     ctl, sid, _, phone = await _limited_call(monkeypatch, idle_timeout=0, max_seconds=None)
@@ -336,6 +337,35 @@ async def test_the_call_ends_at_max_seconds_and_no_limit_means_no_end(monkeypatc
     task.cancel()
     await ctl.close()
     await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_the_call_says_once_that_it_will_end_and_still_ends_on_time(monkeypatch: Any) -> None:
+    monkeypatch.setattr(controller, "HEADS_UP_S", 0.4)
+    monkeypatch.setattr(controller, "HEADS_UP_LEAD_S", 0.2)
+    ctl, sid, spoken, phone = await _limited_call(monkeypatch, idle_timeout=0, max_seconds=1)
+    started = asyncio.get_running_loop().time()
+    await asyncio.wait_for(ctl._limit(sid), 5)
+    assert asyncio.get_running_loop().time() - started < 1.5  # nothing extended the limit
+    assert sid not in ctl.calls
+    assert spoken.count(controller.HEADS_UP) == 1
+    await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_heads_up_queued_before_hang_up_is_not_sent_as_text() -> None:
+    said: list[str] = []
+
+    class Convo:
+        closed = True
+
+        async def say(self, text: str, **_: Any) -> None:
+            said.append(text)
+
+    await controller.CallController._heads_up(Convo())  # type: ignore[arg-type]
+    Convo.closed = False
+    await controller.CallController._heads_up(Convo())  # type: ignore[arg-type]
+    assert said == [controller.HEADS_UP]
 
 
 @pytest.mark.asyncio
@@ -521,6 +551,49 @@ async def test_hanging_up_does_not_cancel_the_agents_work() -> None:
     assert done.is_set()
     assert ("alice@example.org", "All done.") in ctl.host.texts  # type: ignore[attr-defined]
     await phone.close()
+
+
+def test_session_title_templates() -> None:
+    values = {
+        "direction": "to", "name": "alice", "jid": "alice@example.org",
+        "time": "2026-11-11 09:00", "date": "2026-11-11", "topic": "daily note",
+    }  # fmt: skip
+    render = controller.render_title
+    assert (
+        render(controller.TITLE_DEFAULTS["per_call"], **values)
+        == "Call to alice 2026-11-11 09:00 daily note"
+    )
+    assert render("{date} {name}: {topic}", **values) == "2026-11-11 alice: daily note"
+    assert render("{topic}", **{**values, "topic": ""}) is None  # nothing left: use the default
+    assert render("Calls with {name}", **values) == "Calls with alice"
+    assert render("/stop {name}\n/new", **values) == "stop alice /new"  # one line, no command
+    assert render("x" * 300, **values) == "x" * 100
+    for bad in ("{nope}", "{name.upper}", "{name!r}", "{name:>10}", "{name", "}"):
+        assert render(bad, **values) is None, bad
+
+
+def test_every_call_asks_the_host_to_title_its_session() -> None:
+    ctl, _ = make()
+    ctl.config = CallConfig(session="per_peer", session_title="Calls with {name} ({date})")
+    seen: list[str] = []
+
+    async def name_call(peer: str, call_id: str, title: str) -> None:
+        seen.append(title)
+
+    ctl.host.name_call = name_call  # type: ignore[method-assign]
+
+    async def run() -> None:
+        for _ in range(2):  # the host decides whether the person's session already has a title
+            ctl._name("sid", "alice@example.org", "from")
+        ctl.config = CallConfig(session="per_peer", session_title="{nope}")  # unusable: default
+        ctl._name("sid", "alice@example.org", "from")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert len(seen) == 3
+    assert seen[0] == seen[1]
+    assert seen[0].startswith("Calls with alice (20")
+    assert seen[2] == "Calls with alice"
 
 
 def test_topic_cannot_smuggle_a_command_into_the_title() -> None:

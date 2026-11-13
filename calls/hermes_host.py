@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -18,9 +19,11 @@ from .speech import HANGUP
 CALL_PROMPT = (
     "This message is spoken on a live phone call and your reply is read aloud. Answer in one to "
     "three short sentences of plain words: no markdown, lists, links or code, and no closing "
-    f"notes about what you skipped or checked. If the caller says goodbye, end with {HANGUP}. "
+    "notes about what you skipped or checked. If the caller says goodbye, bye bye or talk to you "
+    f"later, end with {HANGUP}; a bare 'bye' is not enough (it is often a misheard 'by'). "
     "Always answer out loud: on a call never reply with [SILENT] or an empty message."
 )
+MAX_TITLE = 100  # Hermes' limit for a session title
 NO_REPLY = "returned only a silence marker"  # the gateway's text for a bare [SILENT]
 NUDGE = "[Your last reply was empty. Answer the caller out loud in one short sentence.] "
 TURN_TIMEOUT = 180.0
@@ -87,8 +90,17 @@ class HermesCallHost:
     turn is pending for that chat. Progress messages and anything else go to the chat as usual.
     """
 
-    def __init__(self, adapter: Any, callers: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        adapter: Any,
+        callers: frozenset[str] = frozenset(),
+        session: str = "per_call",
+        rotate: str = "never",
+    ) -> None:
         self.adapter = adapter
+        self.session = session  # "per_call": a Hermes session per call; "per_peer": one per person
+        self.rotate = rotate  # per_peer only: "never", "daily", "weekly" or "monthly"
+        self._threads: dict[str, str] = {}  # call id -> its thread, fixed when the call starts
         self.callers = callers  # who may call or be called; empty: every allowed user
         self.speech = HermesSpeech()
         self._pending: dict[str, _Turn] = {}
@@ -142,10 +154,31 @@ class HermesCallHost:
                 del self._pending[peer]
 
     def _source(self, peer: str, call_id: str) -> Any:
-        # A thread id gives every call its own Hermes session, listed with its full history.
+        # A thread id keeps the calls out of the person's text chat session: one thread per call,
+        # or one shared thread for all their calls. Either way the session lists its full history.
+        thread = self._threads.get(call_id) or self._thread(call_id)
         return self.adapter.build_source(
-            chat_id=peer, chat_type="dm", user_id=peer, user_name=None, thread_id=f"call-{call_id}"
+            chat_id=peer, chat_type="dm", user_id=peer, user_name=None, thread_id=thread
         )
+
+    def _thread(self, call_id: str) -> str:
+        """The call's thread, fixed on first use: a call that runs past midnight (or into a new
+        week) stays in the session it started in. `per_peer` rotation puts the period in the
+        name (`calls-2026-W46`), so each period is a new session; Hermes then numbers its title."""
+        if self.session != "per_peer":
+            thread = f"call-{call_id}"
+        else:
+            now = datetime.now()
+            period = {
+                "daily": now.strftime("-%Y-%m-%d"),
+                "weekly": f"-{now.isocalendar().year}-W{now.isocalendar().week:02d}",
+                "monthly": now.strftime("-%Y-%m"),
+            }.get(self.rotate, "")
+            thread = f"calls{period}"
+        while len(self._threads) >= 64:  # only calls in progress matter
+            del self._threads[next(iter(self._threads))]
+        self._threads[call_id] = thread
+        return thread
 
     async def steer(self, peer: str, call_id: str, text: str) -> bool:
         """Mid-turn speech goes to the running agent as `/steer`. Unverified against a live
@@ -174,6 +207,34 @@ class HermesCallHost:
             return False
         return True
 
+    async def _free_title(self, source: Any, title: str) -> str | None:
+        """Hermes keeps session titles unique and refuses a taken one (silently here), so ask first.
+        None: the call's session already has a title, keep it (the next call of a per_peer person,
+        or a session that was reset and is titled again). Else the title, or Hermes' own numbering
+        ("title #2") when another session has it. Without the gateway's session database (older
+        Hermes) the title is sent as it is."""
+        runner = getattr(self.adapter, "gateway_runner", None)
+        db = getattr(runner, "_session_db", None)
+        store = getattr(runner, "async_session_store", None)
+        if db is None or store is None:
+            return title
+        try:
+            from hermes_state import SessionDB  # type: ignore[import-not-found]
+
+            title = SessionDB.sanitize_title(title) or title
+            entry = await store.get_or_create_session(source)
+            if await db.get_session_title(entry.session_id):
+                return None
+            free = str(await db.get_next_title_in_lineage(title))
+            if len(free) > MAX_TITLE:  # " #2" does not fit: shorten the base, then number it
+                free = str(await db.get_next_title_in_lineage(title[: MAX_TITLE - 5]))[:MAX_TITLE]
+            return free
+        except Exception:
+            logging.debug(
+                "calls: could not look up the session title; sending it as it is", exc_info=True
+            )
+            return title
+
     async def name_call(self, peer: str, call_id: str, title: str) -> None:
         """Title the call's session with the built-in /title command; its acknowledgement is
         not sent to the chat. Needs a live gateway: any failure is logged and ignored."""
@@ -185,11 +246,14 @@ class HermesCallHost:
         message_id = f"call-title-{call_id}"
         self._silent.add(message_id)
         try:
+            source = self._source(peer, call_id)
+            if (free := await self._free_title(source, title)) is None:
+                return
             await self.adapter.handle_message(
                 MessageEvent(
-                    text=f"/title {title}",
+                    text=f"/title {free}",
                     message_type=MessageType.COMMAND,
-                    source=self._source(peer, call_id),
+                    source=source,
                     message_id=message_id,
                 )
             )
